@@ -37,6 +37,12 @@ contract UpDownSettlementTest is Test {
 
     // Test maker with known key so we can sign EIP-712 orders in-test via vm.sign.
     Vm.Wallet internal maker;
+    /// @dev PR-O Step 2: dedicated address that pre-funds `marketRetained`
+    ///      via complementaryMint before every fill. Mirrors the bot's
+    ///      mint-and-quote flow on the dev runner. Tests don't assert on
+    ///      backer balance; it just exists so the new NoBackingForSeller
+    ///      guard doesn't fail every legacy test.
+    address internal backer = makeAddr("backer");
 
     function setUp() public {
         vm.warp(1_700_000_000);
@@ -56,6 +62,24 @@ contract UpDownSettlementTest is Test {
         usdt.mint(maker.addr, 10_000_000e18);
         vm.prank(maker.addr);
         usdt.approve(address(s), type(uint256).max);
+
+        // PR-O Step 2: backer is the "DMM that pre-minted complementary
+        // shares" for the market. Fund + approve so `_preMintBacking` can
+        // call complementaryMint(minter=backer).
+        usdt.mint(backer, 10_000_000e18);
+        vm.prank(backer);
+        usdt.approve(address(s), type(uint256).max);
+    }
+
+    /// @dev PR-O Step 2: pre-fund `marketRetained[marketId]` via
+    ///      complementaryMint from `backer`. Every fill helper calls this
+    ///      with the fill amount so the new NoBackingForSeller guard
+    ///      passes. The mint is exactly `amount`, which covers
+    ///      `mintBackingDelta = (10000 - price)/10000 * amount` for ANY
+    ///      price (since 10000-price <= 10000).
+    function _preMintBacking(uint256 marketId, uint256 amount) internal {
+        vm.prank(relayer);
+        s.complementaryMint(marketId, amount, backer);
     }
 
     // Internal helper: makers sign an EIP-712 Order and we submit it through enterPosition.
@@ -66,6 +90,23 @@ contract UpDownSettlementTest is Test {
     /// Keeps the existing test bodies' visual shape intact while
     /// preserving the new onlyRelayer guard semantics.
     function _callEnter(
+        UpDownSettlement.Order memory order,
+        bytes memory sig,
+        uint256 mid,
+        uint8 option,
+        uint256 amount
+    ) internal {
+        // PR-O Step 2: pre-mint backing so NoBackingForSeller passes.
+        _preMintBacking(mid, amount);
+        _callEnterRaw(order, sig, mid, option, amount);
+    }
+
+    /// @dev PR-O Step 2: no-premint variant used by vm.expectRevert tests
+    ///      where the pre-mint side-effect inside the expected-revert
+    ///      window would swallow the wrong call. Caller is responsible for
+    ///      pre-funding `marketRetained` before invoking this if the test
+    ///      needs the body to reach past the NoBackingForSeller guard.
+    function _callEnterRaw(
         UpDownSettlement.Order memory order,
         bytes memory sig,
         uint256 mid,
@@ -113,6 +154,8 @@ contract UpDownSettlementTest is Test {
         bytes32 digest = s.orderDigest(order);
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
+        // PR-O Step 2: pre-mint backing so NoBackingForSeller passes.
+        _preMintBacking(marketId, amount);
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
             order: order,
             signature: sig,
@@ -156,6 +199,8 @@ contract UpDownSettlementTest is Test {
         bytes32 digest = s.orderDigest(order);
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
+        // PR-O Step 2: pre-mint backing.
+        _preMintBacking(marketId, amount);
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
             order: order,
             signature: sig,
@@ -196,8 +241,8 @@ contract UpDownSettlementTest is Test {
         _fill(mid, 2, 200e18, 2);
 
         UpDownSettlement.Market memory m = s.getMarket(mid);
-        assertEq(m.totalUp, 100e18);
-        assertEq(m.totalDown, 200e18);
+        assertEq(m.cashUpFlow, 100e18);
+        assertEq(m.cashDownFlow, 200e18);
     }
 
     // ── Signature-path tests (new) ──────────────────────────────────────
@@ -223,8 +268,9 @@ contract UpDownSettlementTest is Test {
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(imposter.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
 
+        _preMintBacking(mid, 50e18);
         vm.expectRevert(UpDownSettlement.InvalidSignature.selector);
-        _callEnter(order, sig, mid, 1, 50e18);
+        _callEnterRaw(order, sig, mid, 1, 50e18);
     }
 
     function test_rejectsFillExceedingSignedAmount() public {
@@ -248,8 +294,9 @@ contract UpDownSettlementTest is Test {
 
         // First call for 60 ok; second call for 41 (total 101 > 100) must revert.
         _callEnter(order, sig, mid, 1, 60e18);
+        _preMintBacking(mid, 41e18);
         vm.expectRevert(UpDownSettlement.FillExceedsOrderAmount.selector);
-        _callEnter(order, sig, mid, 1, 41e18);
+        _callEnterRaw(order, sig, mid, 1, 41e18);
     }
 
     function test_partialFillsAccumulate() public {
@@ -274,7 +321,7 @@ contract UpDownSettlementTest is Test {
         _callEnter(order, sig, mid, 2, 30e18);
         _callEnter(order, sig, mid, 2, 40e18);
         _callEnter(order, sig, mid, 2, 30e18); // exactly at cap
-        assertEq(s.getMarket(mid).totalDown, 100e18);
+        assertEq(s.getMarket(mid).cashDownFlow, 100e18);
         assertEq(s.orderRemaining(order), 0);
     }
 
@@ -297,9 +344,10 @@ contract UpDownSettlementTest is Test {
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
 
+        _preMintBacking(mid, 50e18);
         vm.warp(order.expiry + 1);
         vm.expectRevert(UpDownSettlement.OrderExpired.selector);
-        _callEnter(order, sig, mid, 1, 50e18);
+        _callEnterRaw(order, sig, mid, 1, 50e18);
     }
 
     function test_rejectsMarketMismatch() public {
@@ -323,8 +371,9 @@ contract UpDownSettlementTest is Test {
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
 
+        _preMintBacking(other, 50e18);
         vm.expectRevert(UpDownSettlement.MarketMismatch.selector);
-        _callEnter(order, sig, other, 1, 50e18);
+        _callEnterRaw(order, sig, other, 1, 50e18);
     }
 
     function test_rejectsInvalidSide() public {
@@ -349,8 +398,9 @@ contract UpDownSettlementTest is Test {
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
 
+        _preMintBacking(mid, 50e18);
         vm.expectRevert(UpDownSettlement.InvalidSide.selector);
-        _callEnter(order, sig, mid, 1, 50e18);
+        _callEnterRaw(order, sig, mid, 1, 50e18);
     }
 
     function test_erc1271_smartAccountAsMaker() public {
@@ -385,9 +435,11 @@ contract UpDownSettlementTest is Test {
 
         uint256 saBefore = usdt.balanceOf(address(sa));
         _callEnter(order, sig, mid, 1, 50e18);
-        // USDT was pulled from the SA, not from the EOA owner.
-        assertEq(usdt.balanceOf(address(sa)), saBefore - 50e18);
-        assertEq(s.getMarket(mid).totalUp, 50e18);
+        // PR-O Step 2: SA pays only the cash side (price=5500 → 27.5 USDT
+        // for a 50e18 fill); pre-PR-O it paid the full 50e18. Test asserts
+        // the new Option B semantic.
+        assertEq(usdt.balanceOf(address(sa)), saBefore - 27.5e18);
+        assertEq(s.getMarket(mid).cashUpFlow, 50e18);
     }
 
     function test_erc1271_rejectsWrongOwnerSignature() public {
@@ -414,8 +466,9 @@ contract UpDownSettlementTest is Test {
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(imposter.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
 
+        _preMintBacking(mid, 50e18);
         vm.expectRevert(UpDownSettlement.InvalidSignature.selector);
-        _callEnter(order, sig, mid, 1, 50e18);
+        _callEnterRaw(order, sig, mid, 1, 50e18);
     }
 
     function test_pr5_onlyRelayerCanSubmit() public {
@@ -458,10 +511,13 @@ contract UpDownSettlementTest is Test {
         vm.expectRevert(UpDownSettlement.OnlyRelayer.selector);
         s.enterPosition(f);
 
+        // PR-O Step 2: pre-mint backing so the relayer's call passes
+        // NoBackingForSeller. The onlyRelayer assertion above was orthogonal.
+        _preMintBacking(mid, 50e18);
         // Relayer succeeds.
         vm.prank(relayer);
         s.enterPosition(f);
-        assertEq(s.getMarket(mid).totalUp, 50e18);
+        assertEq(s.getMarket(mid).cashUpFlow, 50e18);
     }
 
     // ── End-to-end flow tests (adapted to signed-order path) ────────────
@@ -521,15 +577,21 @@ contract UpDownSettlementTest is Test {
         s.resolve(mid, 2e18, 1);
 
         uint256 relBefore = usdt.balanceOf(relayer);
-        // Pre-withdraw, the contract holds the per-market retained.
-        assertEq(s.marketRetained(mid), 2000e18);
+        // PR-O Step 2: marketRetained now combines pre-mint deposits +
+        // any cashPart-vs-sellerReceives excess from fills. With `_fill`
+        // setting sellerReceives=0 and seller=address(0), the contract
+        // retains the full cashPart per fill (= price * amount / 10000).
+        //   2 × 1000e18 from _preMintBacking pre-fills
+        // + 2 × 550e18 from cashPart-with-no-seller retained at fill time
+        // = 3100e18 total.
+        assertEq(s.marketRetained(mid), 3100e18);
 
         vm.prank(relayer);
         s.withdrawSettlement(mid);
 
         // Post-withdraw: relayer holds the full retained, on-chain
         // bookkeeping is cleared.
-        assertEq(usdt.balanceOf(relayer), relBefore + 2000e18);
+        assertEq(usdt.balanceOf(relayer), relBefore + 3100e18);
         assertEq(s.marketRetained(mid), 0);
 
         UpDownSettlement.Market memory m = s.getMarket(mid);
@@ -870,31 +932,47 @@ contract UpDownSettlementTest is Test {
 
     function test_pr5_atomicHappyPath_buyerPaysSellerTreasuryMakerAtomically() public {
         (uint256 mid, address treas, address sellerEoa,) = _atomicFixture();
-        // Buyer is the maker (BUY-side), seller is the taker.
-        // 100 USDT fill, 95 to seller, 0.7 platform fee, 0.8 maker rebate.
+        // PR-O Step 2: Option B fee model. Price = 5500 (in _fillAtomic),
+        // fillAmount = 100e18. Cash-side = 55e18; seller receives the full
+        // cash side, fees pulled on top.
         uint256 fillAmt = 100e18;
-        uint256 sellerReceives = 95e18;
+        uint256 cashPart = 55e18;
+        uint256 sellerReceives = cashPart;
         uint256 platformFee = 7e17; // 0.7
-        uint256 makerFee = 8e17;    // 0.8 — total = 96.5; buyer's residual 3.5 stays in pool
+        uint256 makerFee = 8e17;    // 0.8 — pulled on top, fill is pool-neutral
 
         uint256 buyerBefore = usdt.balanceOf(maker.addr);
         uint256 contractBefore = usdt.balanceOf(address(s));
+        uint256 backerBefore = usdt.balanceOf(backer);
         uint256 sellerBefore = usdt.balanceOf(sellerEoa);
         uint256 treasBefore = usdt.balanceOf(treas);
 
         _fillAtomic(mid, 1, fillAmt, 100, sellerEoa, sellerReceives, platformFee, makerFee, maker.addr);
 
-        // Buyer (= maker) paid `fillAmt` out of their wallet.
-        assertEq(usdt.balanceOf(maker.addr), buyerBefore - fillAmt + makerFee, "buyer net = -fill + makerFee (maker is also recipient)");
-        // Seller received `sellerReceives`.
+        // Buyer (= maker) paid cashPart + platformFee + makerFee; got
+        // makerFee back as the makerFeeRecipient. Net: -(cashPart + platformFee).
+        assertEq(
+            usdt.balanceOf(maker.addr),
+            buyerBefore - (cashPart + platformFee),
+            "buyer net = -(cashPart + platformFee); makerFee rebated back"
+        );
+        // Seller received full cash side.
         assertEq(usdt.balanceOf(sellerEoa), sellerBefore + sellerReceives);
-        // Treasury received `platformFee`.
+        // Treasury received platformFee.
         assertEq(usdt.balanceOf(treas), treasBefore + platformFee);
-        // Contract retains the residual.
-        uint256 residual = fillAmt - sellerReceives - platformFee - makerFee;
-        assertEq(usdt.balanceOf(address(s)), contractBefore + residual, "contract retains the buyer's residual for at-resolution backing");
+        // Backer pre-funded marketRetained via _preMintBacking (= fillAmt).
+        assertEq(usdt.balanceOf(backer), backerBefore - fillAmt);
+        // Contract balance change = pre-mint deposit (fill itself is
+        // balance-neutral under Option B with sellerReceives = cashPart).
+        assertEq(
+            usdt.balanceOf(address(s)),
+            contractBefore + fillAmt,
+            "contract retains the pre-mint deposit; fill itself is pool-neutral"
+        );
         // PositionEntered + FillSettled both fired.
-        assertEq(s.getMarket(mid).totalUp, fillAmt);
+        assertEq(s.getMarket(mid).cashUpFlow, fillAmt);
+        // marketRetained = the pre-mint deposit (fill added 0).
+        assertEq(s.marketRetained(mid), fillAmt);
     }
 
     function test_pr5_feeBreakdownInvalid_revertsWhenSumExceedsFill() public {
@@ -946,9 +1024,10 @@ contract UpDownSettlementTest is Test {
         bytes32 digest = sNoTreas.orderDigest(order);
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
+        // PR-O Step 2: Option B numbers — sellerReceives <= cashPart (55).
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
             order: order, signature: sig, marketId: mid, option: 1,
-            fillAmount: 100e18, taker: sellerEoa, sellerReceives: 90e18,
+            fillAmount: 100e18, taker: sellerEoa, sellerReceives: 55e18,
             platformFee: 1e18, makerFee: 0, makerFeeRecipient: address(0)
         });
         vm.prank(relayer);
@@ -957,36 +1036,42 @@ contract UpDownSettlementTest is Test {
     }
 
     function test_pr5_makerRebateForNonDmmMaker_paid() public {
-        // PR-5-bundle (P0-17): rebates flow to ALL makers, not just DMMs.
-        // The contract has no DMM check on enterPosition — the relayer
-        // computes makerFee for every maker and the contract pays them.
-        // Post-2026-05-12 rebate rebuild: the entire `isDMM` whitelist is
-        // gone, so this test no longer asserts "non-DMM" status (there's
-        // no such status anymore — every maker is treated identically).
+        // PR-O Step 2 + PR-5 (P0-17): rebates flow to ALL makers, not just
+        // DMMs. Buyer (= maker) pays cashPart + fees and gets makerFee back
+        // (they're also the makerFeeRecipient).
         (uint256 mid,, address sellerEoa,) = _atomicFixture();
 
         uint256 makerBefore = usdt.balanceOf(maker.addr);
-        // 100 fill, 95 to seller, 1 platform, 1 maker rebate. Buyer = maker.
-        _fillAtomic(mid, 1, 100e18, 103, sellerEoa, 95e18, 1e18, 1e18, maker.addr);
+        // 100 fill at price 5500 → cashPart = 55. sellerReceives = 55, 1
+        // platform, 1 maker rebate. Buyer = maker = makerFeeRecipient.
+        _fillAtomic(mid, 1, 100e18, 103, sellerEoa, 55e18, 1e18, 1e18, maker.addr);
 
-        // Maker paid 100 out (as buyer), got 1 back as rebate. Net = -99.
-        assertEq(usdt.balanceOf(maker.addr), makerBefore - 100e18 + 1e18);
+        // Maker paid (cashPart + platformFee + makerFee) = 57; got makerFee
+        // back as rebate. Net delta = -(cashPart + platformFee) = -56.
+        assertEq(usdt.balanceOf(maker.addr), makerBefore - 55e18 - 1e18);
     }
 
     function test_pr5_zeroSellerSkipsSellerTransfer_initialIssuance() public {
-        // PR-5: when seller == address(0), the fill is initial issuance
-        // (no counterparty cashing out). Only fees + buyer pull happen.
+        // PR-O Step 2: when seller == address(0), the fill is initial
+        // issuance — no counterparty payout. Buyer pays cashPart + fees;
+        // contract retains cashPart in marketRetained (since
+        // sellerReceives=0, the excess `cashPart - 0 = cashPart` settles
+        // into the pool).
         (uint256 mid, address treas,,) = _atomicFixture();
         uint256 contractBefore = usdt.balanceOf(address(s));
         uint256 makerBefore = usdt.balanceOf(maker.addr);
 
-        // 100 fill, no seller, 1 platform, 0 maker. Buyer pays 100, treasury gets 1.
+        // 100 fill at price 5500 → cashPart = 55. No seller (initial issuance).
+        // 1 platform fee, 0 maker fee. Buyer pulls cashPart + 1 platform = 56.
         _fillAtomic(mid, 1, 100e18, 104, address(0), 0, 1e18, 0, address(0));
 
-        assertEq(usdt.balanceOf(maker.addr), makerBefore - 100e18);
+        // Buyer paid cashPart + platformFee = 56.
+        assertEq(usdt.balanceOf(maker.addr), makerBefore - 55e18 - 1e18);
+        // Treasury got platformFee.
         assertEq(usdt.balanceOf(treas), 1e18);
-        // Contract retains 99 (fillAmount - platformFee).
-        assertEq(usdt.balanceOf(address(s)), contractBefore + 99e18);
+        // Contract balance delta = pre-mint (100) + cashPart (55, no seller
+        // to pay) = 155. PlatformFee left the contract atomically.
+        assertEq(usdt.balanceOf(address(s)), contractBefore + 100e18 + 55e18);
     }
 
     function test_pr5_conservationInvariant_sumOfDeltasEqualsZero() public {
@@ -1002,14 +1087,21 @@ contract UpDownSettlementTest is Test {
         int256 treasBefore = int256(usdt.balanceOf(treas));
         int256 makerBefore = int256(usdt.balanceOf(makerRecipient));
         int256 contractBefore = int256(usdt.balanceOf(address(s)));
+        // PR-O Step 2: backer pre-mints into marketRetained (via _fillAtomic
+        // helper); include in the conservation sum so the property holds
+        // over the full set of touched accounts.
+        int256 backerBefore = int256(usdt.balanceOf(backer));
 
-        _fillAtomic(mid, 1, 100e18, 105, sellerEoa, 90e18, 5e18, 4e18, makerRecipient);
+        // 100 fill at price 5500 → cashPart = 55. sellerReceives = 55 (=
+        // cashPart, Option B). Fees pulled on top.
+        _fillAtomic(mid, 1, 100e18, 105, sellerEoa, 55e18, 5e18, 4e18, makerRecipient);
 
         int256 sumDelta = (int256(usdt.balanceOf(maker.addr)) - buyerBefore)
             + (int256(usdt.balanceOf(sellerEoa)) - sellerBefore)
             + (int256(usdt.balanceOf(treas)) - treasBefore)
             + (int256(usdt.balanceOf(makerRecipient)) - makerBefore)
-            + (int256(usdt.balanceOf(address(s))) - contractBefore);
+            + (int256(usdt.balanceOf(address(s))) - contractBefore)
+            + (int256(usdt.balanceOf(backer)) - backerBefore);
         assertEq(sumDelta, 0, "conservation: no USDT created or destroyed");
     }
 
@@ -1029,13 +1121,19 @@ contract UpDownSettlementTest is Test {
         });
         bytes32 structHash = s.hashOrder(order);
 
+        // PR-O Step 2: _fillAtomic internally pre-mints first (emits
+        // ComplementaryMinted) THEN enterPosition (emits FillSettled). The
+        // expectEmit was scoped to the next event; pre-mint inline so the
+        // FillSettled is the next one matched.
+        _preMintBacking(mid, 100e18);
+
         vm.expectEmit(true, true, true, true);
         emit UpDownSettlement.FillSettled(
             structHash,
             maker.addr,    // buyer (BUY-side maker)
             sellerEoa,     // seller (taker)
             100e18,
-            90e18,
+            55e18,         // sellerReceives = cashPart (Option B)
             5e18,
             4e18,
             maker.addr     // makerFeeRecipient
@@ -1044,7 +1142,24 @@ contract UpDownSettlementTest is Test {
         // index args only.
         treas;
 
-        _fillAtomic(mid, 1, 100e18, 106, sellerEoa, 90e18, 5e18, 4e18, maker.addr);
+        // Bypass _fillAtomic's auto-premint since we already minted above.
+        bytes32 digest = s.orderDigest(order);
+        (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
+        bytes memory sig = abi.encodePacked(r, sSig, v);
+        UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
+            order: order,
+            signature: sig,
+            marketId: mid,
+            option: 1,
+            fillAmount: 100e18,
+            taker: sellerEoa,
+            sellerReceives: 55e18,
+            platformFee: 5e18,
+            makerFee: 4e18,
+            makerFeeRecipient: maker.addr
+        });
+        vm.prank(relayer);
+        s.enterPosition(f);
     }
 
     function test_pr5_setTreasury_emitsAndOnlyOwner() public {

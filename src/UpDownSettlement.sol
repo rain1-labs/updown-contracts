@@ -51,13 +51,32 @@ contract UpDownSettlement is Ownable, EIP712 {
     ///         the smaller of treasury balance and allowance — whichever
     ///         constraint is binding.
     error TreasuryUnderFunded(uint256 want, uint256 have);
+    /// @notice PR-O Step 2 (FLAG-3 / R-6): a SELL filled against this market
+    ///         must be backed by a prior `complementaryMint` of the same
+    ///         maker. Concretely: `marketRetained[marketId] >= mintBackingDelta`
+    ///         where `mintBackingDelta = (10000 - price) * fillAmount / 10000`.
+    ///         The buyer pays only the cash side (`price * fillAmount / 10000`);
+    ///         the residual `mintBackingDelta` is the share-creation
+    ///         obligation that must already be funded in the pool.
+    /// @param  marketId  the market the fill is targeting
+    /// @param  needed    `mintBackingDelta` — the residual the buyer is NOT paying
+    /// @param  available `marketRetained[marketId]` at the time of the check
+    error NoBackingForSeller(uint256 marketId, uint256 needed, uint256 available);
 
     // ── Types ───────────────────────────────────────────────────────────
     /// @dev Packed for cheaper `createMarket` (fewer cold storage slots on first write).
+    ///
+    /// PR-O Step 2 rename: `totalUp` / `totalDown` → `cashUpFlow` / `cashDownFlow`.
+    /// Under PR-O, these no longer track "outstanding shares" — they track the
+    /// cumulative *cash-side* notional that flowed through fills on each option.
+    /// Outstanding shares live off-chain in `Position.sharesBought - sharesSold`
+    /// per the relayer's Mongo ledger; the on-chain counters are analytics
+    /// only. Renaming removes the audit ambiguity that "totalUp" might be
+    /// interpreted as a share or backing total.
     struct Market {
         bytes32 pairId;
-        uint128 totalUp;
-        uint128 totalDown;
+        uint128 cashUpFlow;
+        uint128 cashDownFlow;
         uint64 startTime;
         uint64 endTime;
         uint32 duration; // 300, 900, 3600
@@ -131,6 +150,14 @@ contract UpDownSettlement is Ownable, EIP712 {
         address makerFeeRecipient
     );
     event TreasurySet(address indexed previous, address indexed current);
+    /// @notice PR-O Step 2: emitted on `complementaryMint`. `marketId` and
+    ///         `minter` are indexed for the SUBMITTED-stuck recovery path in
+    ///         SettlementService — the off-chain poller filters
+    ///         `(marketId, minter)` and checks the amount field to
+    ///         disambiguate which intent the log corresponds to.
+    event ComplementaryMinted(uint256 indexed marketId, address indexed minter, uint256 amount);
+    /// @notice PR-O Step 2: emitted on `complementaryBurn`.
+    event ComplementaryBurned(uint256 indexed marketId, address indexed holder, uint256 amount);
 
     // ── Immutables / roles ─────────────────────────────────────────────
     IERC20 public immutable usdt;
@@ -175,7 +202,7 @@ contract UpDownSettlement is Ownable, EIP712 {
     ///         money `withdrawSettlement` should hand to the relayer at resolution.
     ///
     ///         Pre-fix, `withdrawSettlement` recomputed `totalPool × (1 − feeBps/10000)`
-    ///         from `m.totalUp + m.totalDown` — a number that has no relationship to the
+    ///         from `m.cashUpFlow + m.cashDownFlow` — a number that has no relationship to the
     ///         actual residual under price-aware atomic settlement. The relayer was
     ///         either short-paid (drained its own USDT to cover winners) or over-paid
     ///         (drained backing of unrelated open markets).
@@ -262,8 +289,8 @@ contract UpDownSettlement is Ownable, EIP712 {
         marketId = ++nextMarketId;
         markets[marketId] = Market({
             pairId: pairId,
-            totalUp: 0,
-            totalDown: 0,
+            cashUpFlow: 0,
+            cashDownFlow: 0,
             startTime: startTime,
             endTime: endTime,
             duration: uint32(duration),
@@ -326,19 +353,35 @@ contract UpDownSettlement is Ownable, EIP712 {
         address makerFeeRecipient; // typically = order.maker (the resting side)
     }
 
-    /// @notice PR-5-bundle (P0-7 + P0-13 + P0-17): atomic settlement entry
-    ///         point. Pulls `fillAmount` from the buyer and atomically pays
-    ///         the seller, treasury, and maker in the same tx — closes the
-    ///         off-chain BalanceModel ledger gap (P0-7), the relayer-only
-    ///         guard prevents anyone with a leaked signed order from
-    ///         filling it post-cancel (P0-13), and maker rebates flow to
-    ///         every maker (not just DMMs — closes P0-17).
-    /// @dev    `f.sellerReceives + f.platformFee + f.makerFee` must be
-    ///         `<= f.fillAmount` (the contract retains the remainder for
-    ///         at-resolution backing of the buyer's position). The
-    ///         relayer is trusted to compute these from the off-chain fee
-    ///         schedule; the on-chain check is defense-in-depth against
-    ///         off-by-one or malicious relayer.
+    /// @notice PR-O Step 2: atomic Polymarket-parity fill settlement.
+    ///
+    ///         Buyer pays ONLY the cash side of the fill
+    ///         (`price * fillAmount / 10000`) plus fees ON TOP — the
+    ///         residual `(10000 - price) * fillAmount / 10000` backing for
+    ///         the buyer's $1-redemption-at-resolution must already be in
+    ///         `marketRetained[marketId]` from a prior `complementaryMint`
+    ///         by the seller. The `NoBackingForSeller` guard checks this
+    ///         invariant before any token movement; failure means the
+    ///         contract would otherwise issue an unbacked $1 share, which
+    ///         would drain the pool at resolution.
+    ///
+    ///         Fee model = Option B (Phase 1 Section 3 conservation proof):
+    ///         buyer pulls `cashPart + platformFee + makerFee`; seller
+    ///         receives `sellerReceives` (typically `= cashPart`); treasury
+    ///         and `makerFeeRecipient` receive their fees atomically. The
+    ///         `sellerReceives <= cashPart` defense-in-depth check is via
+    ///         `FeeBreakdownInvalid` — any excess (`cashPart - sellerReceives`)
+    ///         flows into `marketRetained` as additional backing (typically
+    ///         zero under Option B; non-zero only if the relayer ever
+    ///         routes maker-side haircuts through the pool).
+    ///
+    ///         Pre-bundle this pulled `fillAmount` and the contract held
+    ///         the residual. Under PR-O the seller's mint deposit is the
+    ///         residual backing — fills are balance-neutral for the pool
+    ///         when `sellerReceives = cashPart`. This is the audit-critical
+    ///         conservation invariant: `usdt.balanceOf(this) ==
+    ///         sum(marketRetained) over un-settled markets`, holds at the
+    ///         boundary of every external call.
     function enterPosition(FillInputs calldata f) external whenNotPaused onlyRelayer {
         // Arg/order consistency (prevents calldata from asking for one market while sig
         // was for another, even though sig itself ties those fields).
@@ -350,12 +393,15 @@ contract UpDownSettlement is Ownable, EIP712 {
         if (f.order.side != 0 && f.order.side != 1) revert InvalidSide();
         if (f.fillAmount == 0) revert FillExceedsOrderAmount();
 
-        // PR-5-bundle: defense-in-depth fee-breakdown check. Relayer is
-        // already gated by onlyRelayer, but a single accidental off-by-one
-        // here drains the contract — cheap to verify before transferring.
-        if (f.sellerReceives + f.platformFee + f.makerFee > f.fillAmount) {
-            revert FeeBreakdownInvalid();
-        }
+        // PR-O Step 2: Option B fee bound. The seller can never receive
+        // more than the cash side — fees flow on top, NOT out of cashPart.
+        // sellerReceives + makerFee + platformFee would have been the
+        // pre-PR-O bound against `fillAmount`; under Option B the bound is
+        // `sellerReceives <= cashPart`. Defense-in-depth: a malformed
+        // relayer call that tries to overpay the seller from pool funds
+        // is rejected before any transfer.
+        uint256 cashPart = (f.order.price * f.fillAmount) / 10000;
+        if (f.sellerReceives > cashPart) revert FeeBreakdownInvalid();
         if (f.platformFee > 0 && treasury == address(0)) revert TreasuryNotConfigured();
 
         // Verify maker's EIP-712 signature over the Order. SignatureChecker
@@ -380,6 +426,20 @@ contract UpDownSettlement is Ownable, EIP712 {
         if (m.startTime == 0) revert MarketNotOpen();
         if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
 
+        // PR-O Step 2 (FLAG-3 / R-6): the seller's share-creation obligation
+        // — the `(10000 - price) * fillAmount / 10000` residual the buyer
+        // is NOT paying — MUST already be in `marketRetained` from a prior
+        // complementaryMint. This is a pure guard: no mutation here. Per
+        // the Phase 1 conservation proof, fills are balance-neutral for
+        // the pool; `marketRetained` only changes on mint / burn /
+        // withdrawSettlement. The check catches the "SELL without backing"
+        // failure mode where the pool would otherwise be implicitly debited
+        // at resolution.
+        uint256 mintBackingDelta = f.fillAmount - cashPart;
+        if (marketRetained[f.marketId] < mintBackingDelta) {
+            revert NoBackingForSeller(f.marketId, mintBackingDelta, marketRetained[f.marketId]);
+        }
+
         // Identify buyer / seller. `taker` is the counterparty to the
         // maker; the BUYER is whichever side has order.side == BUY.
         address buyer;
@@ -392,12 +452,16 @@ contract UpDownSettlement is Ownable, EIP712 {
             seller = f.order.maker;
         }
 
-        // Pull buyer's collateral. Buyer must have approved this contract.
-        usdt.safeTransferFrom(buyer, address(this), f.fillAmount);
+        // PR-O Step 2 (Option B): pull cashPart + fees from buyer. Single
+        // transfer-from keeps the gas down vs. three separate calls; the
+        // contract then distributes downstream. Buyer must have approved
+        // this contract for at least cashPart + platformFee + makerFee.
+        usdt.safeTransferFrom(buyer, address(this), cashPart + f.platformFee + f.makerFee);
 
         // Atomic outflows. Seller may be address(0) for genuine first-issuance
         // legs that have no counterparty (e.g. DMM bootstrap); seller == 0
-        // skips the seller payout but still pays fees.
+        // skips the seller payout but still pays fees, and the excess
+        // (= cashPart) settles into marketRetained below.
         if (seller != address(0) && f.sellerReceives > 0) {
             usdt.safeTransfer(seller, f.sellerReceives);
         }
@@ -408,24 +472,24 @@ contract UpDownSettlement is Ownable, EIP712 {
             usdt.safeTransfer(f.makerFeeRecipient, f.makerFee);
         }
 
-        // Pool tracking — `m.totalUp` / `m.totalDown` retained as ANALYTICS
-        // ONLY post-bundle. The actual at-resolution payout flow is
-        // off-chain Position.netShares × winnerPayoutPerShare per Meir's
-        // 2026-05-03 design call. Drop the storage in a future cleanup
-        // once the off-chain flow has stabilized.
+        // PR-O Step 2 rename: cash-flow counters. NOT outstanding shares —
+        // outstanding lives off-chain in Position.netShares. Bookkeeping /
+        // analytics for indexers; not load-bearing for settlement.
         if (f.order.option == 1) {
-            m.totalUp += uint128(f.fillAmount);
+            m.cashUpFlow += uint128(f.fillAmount);
         } else {
-            m.totalDown += uint128(f.fillAmount);
+            m.cashDownFlow += uint128(f.fillAmount);
         }
 
-        // Per-market retained = collateral pulled in − atomic outflows.
-        // Backed solely by the FeeBreakdownInvalid check on line 331; the
-        // unchecked subtraction is safe-by-construction because that
-        // branch already enforces `outflows ≤ fillAmount`.
+        // PR-O Step 2: marketRetained delta from this fill = cashPart - sellerReceives.
+        // Under Option B the relayer sets sellerReceives = cashPart, so the
+        // delta is 0 (fill is balance-neutral for the pool). The mint
+        // deposit (already in marketRetained) provides the buyer's $1
+        // backing. The unchecked subtraction is safe by the
+        // FeeBreakdownInvalid check above which enforces
+        // `sellerReceives <= cashPart`.
         unchecked {
-            marketRetained[f.marketId] +=
-                f.fillAmount - f.sellerReceives - f.platformFee - f.makerFee;
+            marketRetained[f.marketId] += cashPart - f.sellerReceives;
         }
 
         emit PositionEntered(f.marketId, uint8(f.order.option), f.fillAmount, f.order.maker);
@@ -439,6 +503,75 @@ contract UpDownSettlement is Ownable, EIP712 {
             f.makerFee,
             f.makerFeeRecipient
         );
+    }
+
+    // ── Complementary mint / burn (PR-O Step 2) ─────────────────────────
+    //
+    // Polymarket-parity share-creation primitive: deposit `amount` USDT and
+    // receive (off-chain) `amount` UP shares + `amount` DOWN shares for the
+    // market. Exactly one option pays $1 at resolution, so the deposit
+    // covers exactly one redemption — conservation by construction.
+    //
+    // The contract holds the deposit in `marketRetained[marketId]` until
+    // `withdrawSettlement`. The off-chain side credits both
+    // `Position(maker, market, UP).sharesBought` and `Position(maker,
+    // market, DOWN).sharesBought` by `amount`; that credit is gated on the
+    // on-chain `ComplementaryMinted` event being indexed by the relayer.
+
+    /// @notice PR-O Step 2: deposit `amount` USDT for `minter` and increment
+    ///         the market's retained backing by the same amount. Off-chain
+    ///         the relayer credits Position(minter, market, UP).sharesBought
+    ///         AND Position(minter, market, DOWN).sharesBought by `amount`.
+    ///         Market must be ACTIVE (same `m.endTime` gate as enterPosition).
+    function complementaryMint(uint256 marketId, uint256 amount, address minter)
+        external
+        whenNotPaused
+        onlyRelayer
+    {
+        if (amount == 0) revert FillExceedsOrderAmount();
+        if (minter == address(0)) revert ZeroAddress();
+        Market storage m = markets[marketId];
+        if (m.startTime == 0) revert MarketNotOpen();
+        if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
+
+        usdt.safeTransferFrom(minter, address(this), amount);
+        marketRetained[marketId] += amount;
+
+        emit ComplementaryMinted(marketId, minter, amount);
+    }
+
+    /// @dev TRUST-ASSUMPTION-V1: relayer can complementaryBurn any maker's
+    ///      locked collateral. Same trust level as accumulateRebate. v2 path
+    ///      = maker-signed permit; deferred. The off-chain MintIntent layer
+    ///      mediates burn requests so this entrypoint never fires
+    ///      unsolicited in production. Documented in audit handoff.
+    /// @notice PR-O Step 2: inverse of complementaryMint. Pulls `amount`
+    ///         from `marketRetained[marketId]` and transfers it to `holder`.
+    ///         Off-chain the relayer must have already verified that
+    ///         Position(holder, market, UP).available >= amount AND
+    ///         Position(holder, market, DOWN).available >= amount (off-chain
+    ///         proof; relayer-trust v1).
+    function complementaryBurn(uint256 marketId, uint256 amount, address holder)
+        external
+        whenNotPaused
+        onlyRelayer
+    {
+        if (amount == 0) revert FillExceedsOrderAmount();
+        if (holder == address(0)) revert ZeroAddress();
+        Market storage m = markets[marketId];
+        if (m.startTime == 0) revert MarketNotOpen();
+        if (m.resolved) revert AlreadyResolved();
+
+        // Conservation guard: cannot burn more backing than is retained.
+        // Reverts with the same NoBackingForSeller error used by enterPosition
+        // so off-chain consumers can lump the two failure modes.
+        if (marketRetained[marketId] < amount) {
+            revert NoBackingForSeller(marketId, amount, marketRetained[marketId]);
+        }
+        marketRetained[marketId] -= amount;
+        usdt.safeTransfer(holder, amount);
+
+        emit ComplementaryBurned(marketId, holder, amount);
     }
 
     function resolve(uint256 marketId, int256 settlementPrice, uint8 winner) external onlyResolver whenNotPaused {
