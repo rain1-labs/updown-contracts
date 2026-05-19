@@ -5,8 +5,8 @@ pragma solidity ^0.8.29;
 interface IUpDownSettlement {
     struct Market {
         bytes32 pairId;
-        uint128 totalUp;
-        uint128 totalDown;
+        uint128 cashUpFlow;
+        uint128 cashDownFlow;
         uint64 startTime;
         uint64 endTime;
         uint32 duration;
@@ -28,8 +28,8 @@ interface IUpDownSettlement {
 
     function markets(uint256 marketId) external view returns (
         bytes32 pairId,
-        uint128 totalUp,
-        uint128 totalDown,
+        uint128 cashUpFlow,
+        uint128 cashDownFlow,
         uint64 startTime,
         uint64 endTime,
         uint32 duration,
