@@ -238,6 +238,16 @@ contract UpDownAutoCyclerHarness is UpDownAutoCycler {
         _activeMarkets.push(ActiveMarket({marketId: marketId, endTime: endTime, pairId: pairId}));
     }
 
+    /// @dev F-2026-17780: `_createMarket` now takes the keeper-supplied `plannedStart` and validates
+    ///      it against the expected next slot. The harness computes the expected slot so direct
+    ///      creates never trip the idempotency no-op.
+    function _expectedStart(uint256 tfIdx, bytes32 pairId) internal view returns (uint64) {
+        uint256 dur = timeframes[tfIdx].duration;
+        uint256 lastStart = pairTfLastCreated[pairId][tfIdx];
+        uint256 ps = lastStart == 0 ? (block.timestamp / dur) * dur : lastStart + dur;
+        return uint64(ps);
+    }
+
     function harnessCreateMarket(uint256 tfIdx, bytes32 pairId) external {
         // Streams-strike (2026-05-16): _createMarket forwards `signedReport`
         // to `resolver.captureStrike → _payVerificationFee → abi.decode(_,
@@ -248,11 +258,11 @@ contract UpDownAutoCyclerHarness is UpDownAutoCycler {
         bytes32[3] memory header;
         bytes memory inner = "";
         bytes memory signedReport = abi.encode(header, inner);
-        _createMarket(tfIdx, pairId, signedReport);
+        _createMarket(tfIdx, pairId, _expectedStart(tfIdx, pairId), signedReport);
     }
 
     function harnessCreateMarketWithReport(uint256 tfIdx, bytes32 pairId, bytes calldata signedReport) external {
-        _createMarket(tfIdx, pairId, signedReport);
+        _createMarket(tfIdx, pairId, _expectedStart(tfIdx, pairId), signedReport);
     }
 
     /// @dev F-06 fail-forward tests need to set pairTfLastCreated directly
@@ -293,7 +303,7 @@ contract UpDownUnit is Test {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
-        settlement = new UpDownSettlement(usdt, owner, 70, 80);
+        settlement = new UpDownSettlement(usdt, owner);
         ChainlinkResolver r =
             new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement), address(verifierProxy), address(link));
         settlement.setResolver(address(r));
@@ -372,7 +382,7 @@ contract UpDownUnit is Test {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement settlement = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement settlement = new UpDownSettlement(usdt, owner);
 
         ChainlinkResolver resolver =
             new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement), address(verifierProxy), address(link));
@@ -668,7 +678,7 @@ contract UpDownUnit is Test {
     function test_F04_constructorRejectsZeroResolver() public {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement st = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement st = new UpDownSettlement(usdt, owner);
         vm.expectRevert(UpDownAutoCycler.ZeroAddress.selector);
         new UpDownAutoCyclerHarness(owner, address(0), address(st));
         // silence "unused" warnings on the constructed-but-not-used vars
@@ -683,7 +693,7 @@ contract UpDownUnit is Test {
         // to construct the resolver, then we pass address(0) for the cycler's
         // settlement arg specifically.
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement st = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement st = new UpDownSettlement(usdt, owner);
         ChainlinkResolver r =
             new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(verifierProxy), address(link));
         vm.expectRevert(UpDownAutoCycler.ZeroAddress.selector);
@@ -716,7 +726,7 @@ contract UpDownUnit is Test {
         int256 oversized = int256(type(int128).max) + 1;
         MockBtcFeed feed = new MockBtcFeed(oversized);
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement st = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement st = new UpDownSettlement(usdt, owner);
         ChainlinkResolver r =
             new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(verifierProxy), address(link));
         st.setResolver(address(r));
@@ -742,7 +752,7 @@ contract UpDownUnit is Test {
         int256 boundary = int256(type(int128).max);
         MockBtcFeed feed = new MockBtcFeed(boundary);
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement st = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement st = new UpDownSettlement(usdt, owner);
         ChainlinkResolver r =
             new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(verifierProxy), address(link));
         st.setResolver(address(r));
@@ -757,83 +767,23 @@ contract UpDownUnit is Test {
         assertEq(cycler.activeMarketCount(), 1, "strike at exact boundary should succeed");
     }
 
-    /// @notice F-06 part 2 (fail-forward): when _createMarketExternal reverts
-    ///         in a continuing cycle (lastStart != 0), pairTfLastCreated
-    ///         advances by exactly tf.duration so the next checkUpkeep moves
-    ///         to the FOLLOWING slot instead of retrying this one.
-    function test_F06_failForward_advancesFromContinuingCycle() public {
-        // RevertingSettlement always reverts on createMarket, so any
-        // _createMarket call fails after the resolver.getPrice + F-06
-        // strike check pass.
-        RevertingSettlement bad = new RevertingSettlement();
+    /// @notice F-2026-17726 (NEW transient policy): a TRANSIENT create failure (bad/unavailable
+    ///         report — here a missing streams feed) must NOT advance `pairTfLastCreated`. The next
+    ///         checkUpkeep re-flags the same slot so a legit retry with a fresh report creates it.
+    ///         This is the opposite of the V1 fail-forward, which advanced on any revert and let an
+    ///         attacker push the pointer arbitrarily far for gas only.
+    function test_F17726_transientFailure_doesNotAdvance() public {
+        // Resolver with NO streamsFeedId configured for BTC → captureStrike reverts
+        // StreamsFeedNotConfigured (a transient/config failure, not PlannedStartTooStale).
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
+        ERC20Mock usdt = new ERC20Mock();
+        UpDownSettlement settlement = new UpDownSettlement(usdt, owner);
         ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
-        UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
-        r.setAuthorizedCaller(address(cycler), true);
-
-        // Seed pairTfLastCreated as if a prior cycle had landed at `now`.
-        // 5m timeframe (tfIdx=0). Manually mirror the storage state.
-        uint256 lastStart = (block.timestamp / 300) * 300;
-        cycler.harnessSetPairTfLastCreated(BTCUSD, 0, lastStart);
-
-        // Warp forward to where the NEXT slot is the only one due.
-        vm.warp(lastStart + 300 + 1);
-
-        // performUpkeep with this single createSlot. _createMarket will
-        // revert inside settlement.createMarket. F-06 catch fires.
-        uint256[] memory empty = new uint256[](0);
-        UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
-        cycler.performUpkeep(abi.encode(empty, slots));
-
-        // pairTfLastCreated must have advanced by exactly one tf.duration.
-        assertEq(
-            cycler.pairTfLastCreated(BTCUSD, 0),
-            lastStart + 300,
-            "failed slot's plannedStart is persisted; next tick advances to lastStart + 2*300"
-        );
-    }
-
-    /// @notice F-06 part 2: when _createMarketExternal reverts on bootstrap
-    ///         (lastStart == 0), pairTfLastCreated snaps to the current
-    ///         floor boundary so the next tick advances to that boundary +
-    ///         duration. Symmetric with _createMarket's bootstrap path.
-    function test_F06_failForward_bootstrapFromZero() public {
-        RevertingSettlement bad = new RevertingSettlement();
-        MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
-        MockBtcFeed feed = new MockBtcFeed(50_000e8);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
-        UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
-        r.setAuthorizedCaller(address(cycler), true);
-
-        // Fresh slate: lastStart == 0. pairTfLastCreated has never been set.
-        assertEq(cycler.pairTfLastCreated(BTCUSD, 0), 0, "pre-condition: bootstrap state");
-
-        uint256[] memory empty = new uint256[](0);
-        UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
-        cycler.performUpkeep(abi.encode(empty, slots));
-
-        uint256 expectedBoundary = (block.timestamp / 300) * 300;
-        assertEq(
-            cycler.pairTfLastCreated(BTCUSD, 0),
-            expectedBoundary,
-            "bootstrap fail-forward aligns to current floor boundary"
-        );
-    }
-
-    /// @notice F-06 part 2: emits `SlotSkippedAfterFailure(pairId, tfIdx,
-    ///         skippedSlotStart)` alongside the existing MarketCreationFailed.
-    function test_F06_failForward_emitsSlotSkipped() public {
-        RevertingSettlement bad = new RevertingSettlement();
-        MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
-        MockBtcFeed feed = new MockBtcFeed(50_000e8);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
-        UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
+            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement), address(verifierProxy), address(link));
+        settlement.setResolver(address(r));
+        UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(settlement));
+        settlement.setAutocycler(address(cycler));
         r.setAuthorizedCaller(address(cycler), true);
 
         uint256 lastStart = (block.timestamp / 300) * 300;
@@ -842,11 +792,84 @@ contract UpDownUnit is Test {
 
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
+        // plannedStart = expected next slot so the idempotency check passes and we reach captureStrike.
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: uint64(lastStart + 300), signedReport: bytes("")});
+        cycler.performUpkeep(abi.encode(empty, slots));
+
+        // Pointer is UNCHANGED — the transient failure does not advance it.
+        assertEq(cycler.pairTfLastCreated(BTCUSD, 0), lastStart, "transient failure must not advance the pointer");
+    }
+
+    /// @notice F-2026-17726 (NEW): a PERMANENT skip (`PlannedStartTooStale` — the slot's window has
+    ///         irrecoverably passed) DOES advance the pointer + emits SlotSkippedAfterFailure, so the
+    ///         cycler catches up to a fresh slot instead of looping on an un-creatable one.
+    function test_F17726_permanentStaleSkip_advancesAndEmits() public {
+        RevertingSettlement bad = new RevertingSettlement();
+        MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
+        MockBtcFeed feed = new MockBtcFeed(50_000e8);
+        ChainlinkResolver r =
+            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
+        UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
+        r.setAuthorizedCaller(address(cycler), true);
+
+        // Seed a prior slot, then warp far past it so the next slot's window is stale
+        // (end + RESOLVER_MAX_STALENESS < now → PlannedStartTooStale before captureStrike).
+        uint256 lastStart = (block.timestamp / 300) * 300;
+        cycler.harnessSetPairTfLastCreated(BTCUSD, 0, lastStart);
+        vm.warp(lastStart + 300 + 2 hours);
+
+        uint256[] memory empty = new uint256[](0);
+        UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: uint64(lastStart + 300), signedReport: bytes("")});
 
         vm.expectEmit(true, true, false, true);
         emit UpDownAutoCycler.SlotSkippedAfterFailure(BTCUSD, 0, lastStart + 300);
         cycler.performUpkeep(abi.encode(empty, slots));
+
+        assertEq(cycler.pairTfLastCreated(BTCUSD, 0), lastStart + 300, "permanent stale skip advances by one duration");
+    }
+
+    /// @notice F-2026-17780: a replayed/duplicate performData (stale `plannedStart`) is a clean
+    ///         idempotent no-op — no create, and crucially NO fail-forward that would skip a valid slot.
+    function test_F17780_stalePlannedStart_isNoOp() public {
+        RevertingSettlement bad = new RevertingSettlement();
+        MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
+        MockBtcFeed feed = new MockBtcFeed(50_000e8);
+        ChainlinkResolver r =
+            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
+        UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
+        r.setAuthorizedCaller(address(cycler), true);
+
+        uint256 lastStart = (block.timestamp / 300) * 300;
+        cycler.harnessSetPairTfLastCreated(BTCUSD, 0, lastStart);
+        vm.warp(lastStart + 300 + 1);
+
+        uint256[] memory empty = new uint256[](0);
+        UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
+        // Stale plannedStart (the already-created slot, not the expected next one).
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: uint64(lastStart), signedReport: bytes("")});
+
+        vm.expectEmit(true, true, false, true);
+        emit UpDownAutoCycler.SlotAlreadyProcessed(BTCUSD, 0, lastStart);
+        cycler.performUpkeep(abi.encode(empty, slots));
+
+        assertEq(cycler.pairTfLastCreated(BTCUSD, 0), lastStart, "stale plannedStart neither creates nor advances");
+    }
+
+    /// @notice F-2026-17726: performUpkeep is gated to the forwarder/owner. A random caller reverts.
+    function test_F17726_performUpkeep_onlyForwarderOrOwner() public {
+        (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
+        uint256[] memory empty = new uint256[](0);
+        UpDownAutoCycler.CreateSlot[] memory noCreates = new UpDownAutoCycler.CreateSlot[](0);
+
+        vm.prank(address(0xBEEF));
+        vm.expectRevert(UpDownAutoCycler.NotForwarder.selector);
+        cycler.performUpkeep(abi.encode(empty, noCreates));
+
+        // After the owner sets a forwarder, that address can drive it.
+        cycler.setForwarder(address(0xBEEF));
+        vm.prank(address(0xBEEF));
+        cycler.performUpkeep(abi.encode(empty, noCreates)); // no revert
     }
 
     /// @notice F-06 part 2 defensive guard: a hand-crafted performData with
@@ -1213,7 +1236,7 @@ contract UpDownUnit is Test {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
-        st = new UpDownSettlement(usdt, owner, 70, 80);
+        st = new UpDownSettlement(usdt, owner);
         r = new ChainlinkResolver(
             owner,
             address(seq),
@@ -1364,6 +1387,47 @@ contract UpDownUnit is Test {
         r.resolve(mid, _fakeSignedReport());
     }
 
+    /// F-2026-17759 (Streams-path extension): the original `price <= 0` guard only protected the
+    /// legacy `_getLatestPrice` Data Feeds view, which the strike/settlement lifecycle no longer
+    /// uses post-migration. The production paths read `report.price` (Data Streams ReportV3) directly,
+    /// so `resolve` and `captureStrike` now apply the same positivity guard — a malformed (zero or
+    /// negative) DON price must revert `InvalidPrice` rather than settle the binary market on garbage.
+    function test_F17759_resolve_revertsZeroStreamsPrice() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+        ReportV3 memory rep = _baseReport(endTs); // valid feedId / window / not expired
+        rep.price = 0; // malformed DON price — only the new guard should catch this
+        verifierProxy.setNextReport(rep);
+
+        vm.expectRevert(ChainlinkResolver.InvalidPrice.selector);
+        r.resolve(mid, _fakeSignedReport());
+    }
+
+    function test_F17759_resolve_revertsNegativeStreamsPrice() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+        ReportV3 memory rep = _baseReport(endTs);
+        rep.price = -1; // negative DON price
+        verifierProxy.setNextReport(rep);
+
+        vm.expectRevert(ChainlinkResolver.InvalidPrice.selector);
+        r.resolve(mid, _fakeSignedReport());
+    }
+
+    function test_F17759_captureStrike_revertsNonPositiveStreamsPrice() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        uint64 startTime = uint64((block.timestamp / 300) * 300); // aligned slot boundary
+        ReportV3 memory rep = _baseReport(uint256(startTime)); // feedId match, not expired
+        rep.observationsTimestamp = uint32(startTime); // inside ±maxStrikeReportLag of the boundary
+        rep.price = 0; // malformed DON price
+        verifierProxy.setNextReport(rep);
+
+        vm.expectRevert(ChainlinkResolver.InvalidPrice.selector);
+        r.captureStrike(BTCUSD, _fakeSignedReport(), startTime);
+    }
+
     function test_streams_resolve_revertsWhenStreamsFeedNotConfigured() public {
         (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
         // Wipe the configured feed-id for BTCUSD to simulate an
@@ -1374,6 +1438,97 @@ contract UpDownUnit is Test {
         verifierProxy.setNextReport(_baseReport(endTs));
 
         vm.expectRevert(ChainlinkResolver.StreamsFeedNotConfigured.selector);
+        r.resolve(mid, _fakeSignedReport());
+    }
+
+    /// Streams-strike migration: a NEW pair configured with ONLY a streams feed-id (no legacy Data
+    /// Feeds aggregator) must be registerable. Pre-fix, `registerMarket` gated on `priceFeeds` alone
+    /// and reverted `FeedNotConfigured`, stranding every Streams-only pair (captureStrike would
+    /// succeed but registration would revert, looping the cycler's fail-forward forever).
+    function test_streams_registerMarket_streamsOnlyPair_succeeds() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        bytes32 solUsd = keccak256("SOL/USD"); // no priceFeeds entry — Streams-only
+        r.configureStreamsFeed(solUsd, bytes32(uint256(0xC0FFEE)));
+
+        uint256 mid = st.createMarket(solUsd, 300, 100e8);
+        // Must NOT revert FeedNotConfigured now that the streams feed-id is set.
+        r.registerMarket(mid, address(st), solUsd, 100e8);
+
+        (, bytes32 pairId,, bool resolved) = r.markets(mid);
+        assertEq(pairId, solUsd, "streams-only pair registered");
+        assertFalse(resolved, "registered, not yet resolved");
+    }
+
+    /// F-2026-17760: `resolve` is gated to authorized callers — an unauthorized address (not a
+    /// configured caller and not the owner) cannot front-run a resolution with a favorable report.
+    function test_F17760_resolve_revertsForUnauthorizedCaller() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert(ChainlinkResolver.NotAuthorizedCaller.selector);
+        r.resolve(1, _fakeSignedReport());
+    }
+
+    /// F-2026-17760: `captureStrike` is likewise gated to authorized callers.
+    function test_F17760_captureStrike_revertsForUnauthorizedCaller() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        uint64 aligned = uint64((block.timestamp / 300) * 300);
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert(ChainlinkResolver.NotAuthorizedCaller.selector);
+        r.captureStrike(BTCUSD, "", aligned);
+    }
+
+    /// F-2026-17760: the owner can tune the observation windows but never re-open them past the hard
+    /// cap, so the tightened window can't be widened back to the exploitable range.
+    function test_F17760_setObservationLag_enforcesCap() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        uint256 cap = r.OBSERVATION_LAG_CAP();
+        vm.expectRevert(abi.encodeWithSelector(ChainlinkResolver.ObservationLagTooLarge.selector, cap + 1, cap));
+        r.setObservationLag(cap + 1, 3);
+        // Within the cap, tuning works.
+        r.setObservationLag(5, 7);
+        assertEq(r.maxReportObservationLag(), 5);
+        assertEq(r.maxStrikeReportLag(), 7);
+    }
+
+    /// F-2026-17760: a fresh deploy must default to the TIGHT 3s window (down from the original 30s).
+    /// The tight default is the load-bearing half of the fix — a wide window let a submitter pick the
+    /// most-favorable still-valid report in a binary market. This pins the default so a regression that
+    /// silently re-widened it would fail here.
+    function test_F17760_observationLagDefaultsToThreeSeconds() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        assertEq(r.maxReportObservationLag(), 3, "resolve observation window defaults to 3s");
+        assertEq(r.maxStrikeReportLag(), 3, "strike observation window defaults to 3s");
+    }
+
+    /// F-2026-17760: an observation exactly at the tight lower edge (endTime - 3s) is ACCEPTED,
+    /// confirming the boundary is inclusive and legitimate close-time reports still resolve.
+    function test_F17760_resolve_acceptsObservationAtWindowEdge() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+        ReportV3 memory rep = _baseReport(endTs);
+        rep.observationsTimestamp = uint32(endTs - 3); // exact lower edge for the 3s default
+        verifierProxy.setNextReport(rep);
+
+        r.resolve(mid, _fakeSignedReport());
+        (,,, bool resolved) = r.markets(mid);
+        assertTrue(resolved, "observation at endTime-3 is inside the tight window");
+    }
+
+    /// F-2026-17760: one second past the tight window (endTime - 4s) is REJECTED. This is the test
+    /// that actually proves the window is the tightened 3s and not the original 30s — under a 30s
+    /// window an endTime-4 observation would still be accepted, so this would not revert.
+    function test_F17760_resolve_rejectsObservationOneSecondPastWindow() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+        ReportV3 memory rep = _baseReport(endTs);
+        rep.observationsTimestamp = uint32(endTs - 4); // 4s old: outside 3s, but inside the old 30s
+        verifierProxy.setNextReport(rep);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ChainlinkResolver.ReportObservationOutOfWindow.selector, endTs, uint256(endTs - 4))
+        );
         r.resolve(mid, _fakeSignedReport());
     }
 
@@ -1450,7 +1605,7 @@ contract UpDownUnit is Test {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement st = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement st = new UpDownSettlement(usdt, owner);
         vm.expectRevert(ChainlinkResolver.ZeroAddress.selector);
         new ChainlinkResolver(
             owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0),
@@ -1462,7 +1617,7 @@ contract UpDownUnit is Test {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
-        UpDownSettlement st = new UpDownSettlement(usdt, owner, 70, 80);
+        UpDownSettlement st = new UpDownSettlement(usdt, owner);
         vm.expectRevert(ChainlinkResolver.ZeroAddress.selector);
         new ChainlinkResolver(
             owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0),
