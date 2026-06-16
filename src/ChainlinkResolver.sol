@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.29;
+pragma solidity 0.8.29;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -11,8 +12,9 @@ import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV3} from "./interfac
 
 /// @title ChainlinkResolver
 /// @notice Reads Chainlink price data and resolves UpDown markets via
-///         `UpDownSettlement.resolve`. Resolution is permissionless — anyone
-///         can submit a valid Data Streams report and the outcome is
+///         `UpDownSettlement.resolve`. Resolution is restricted to authorized
+///         callers (F-2026-17760): only a configured caller (the resolver
+///         service) or the owner can submit a report, and the outcome is
 ///         deterministic (UP if price > strike, else DOWN; tie => DOWN).
 ///
 ///         Price sources after the 2026-05-13 Data Streams swap:
@@ -31,7 +33,7 @@ import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV3} from "./interfac
 ///         balance, ops tops up via direct transfer, owner clawback via
 ///         `withdrawLink`. Separate trust boundary from the rebate
 ///         rebuild's treasury approval pattern (which lives on USDT).
-contract ChainlinkResolver is Ownable {
+contract ChainlinkResolver is Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ── Errors ──────────────────────────────────────────────────────────
@@ -39,6 +41,11 @@ contract ChainlinkResolver is Ownable {
     error SequencerDown();
     error SequencerGracePeriod();
     error StalePrice();
+    /// @notice F-2026-17759: the legacy Data Feeds aggregator returned a
+    ///         non-positive price (0 or negative). A malfunctioning,
+    ///         deprecated, or circuit-broken feed — or one clamped at its
+    ///         min/maxAnswer bound — must never be forwarded as a valid price.
+    error InvalidPrice();
     error MarketNotRegistered();
     error MarketNotExpired();
     error AlreadyResolved();
@@ -84,6 +91,23 @@ contract ChainlinkResolver is Ownable {
     ///         performData (or future external caller) cannot reset the
     ///         strike for an existing slot.
     error StrikeAlreadyCaptured(bytes32 pairId, uint64 startTime);
+    /// @notice F-2026-17729: `startTime` is not aligned to a real slot
+    ///         boundary (`startTime % STRIKE_ALIGNMENT != 0`). The dedup key
+    ///         for paid Streams verifications is `(pairId, startTime)`; without
+    ///         alignment a single valid report observed at `T` is reusable
+    ///         across the 61 integer seconds in `[T-30, T+30]`, each a distinct
+    ///         cache-miss key that bills the resolver's LINK balance. All
+    ///         legitimate slot boundaries are multiples of the smallest
+    ///         timeframe (300s), so requiring alignment collapses the 61x
+    ///         amplification to the single real boundary in the window.
+    error StrikeStartNotAligned(uint64 startTime);
+    /// @notice F-2026-17760: `resolve` / `captureStrike` are now restricted to authorized callers
+    ///         (the cycler captures strikes; the resolver service submits resolutions). Removing the
+    ///         permissionless path eliminates the favorable-report front-run a position holder could
+    ///         otherwise mount within the observation window.
+    error NotAuthorizedCaller();
+    /// @notice F-2026-17760: requested observation lag exceeds the hard cap (`OBSERVATION_LAG_CAP`).
+    error ObservationLagTooLarge(uint256 requested, uint256 cap);
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
@@ -141,7 +165,15 @@ contract ChainlinkResolver is Ownable {
     ///         Asymmetric: lower-bounded only — the report must NOT be
     ///         observed AFTER `endTime` (that would price the market on
     ///         a post-close snapshot).
-    uint256 public constant MAX_REPORT_OBSERVATION_LAG = 30 seconds;
+    ///
+    ///         F-2026-17760: changed from a hard 30s constant to an owner-tunable value with a tight
+    ///         default (3s) and a hard cap (`OBSERVATION_LAG_CAP = 30s`). In a binary market a 1¢
+    ///         cross flips the entire payout, so a wide window let a submitter pick the most-favorable
+    ///         still-valid report. The off-chain resolver fetches the report *by timestamp = endTime*,
+    ///         so the returned observation is within ~1s of close — 3s is reliably hittable while
+    ///         collapsing the selection window 10x. Combined with the authorized-caller gate, the
+    ///         favorable-selection vector is closed.
+    uint256 public maxReportObservationLag = 3 seconds;
     /// @notice Streams-strike (2026-05-16): symmetric ±tolerance for
     ///         `report.observationsTimestamp` vs the market's `startTime`.
     ///         Mirrors `MAX_REPORT_OBSERVATION_LAG` (the settlement-side
@@ -151,7 +183,21 @@ contract ChainlinkResolver is Ownable {
     ///         drift + DON publish cadence; tight enough to prevent
     ///         meaningful price manipulation since Crypto streams update
     ///         sub-second and a ±30s slice is essentially the same price.
-    uint256 public constant MAX_STRIKE_REPORT_LAG = 30 seconds;
+    ///
+    ///         F-2026-17760: same change as the settlement-side lag — owner-tunable, tight default
+    ///         (3s), hard-capped at `OBSERVATION_LAG_CAP`. The cycler fetches the strike report for the
+    ///         exact clock-aligned `plannedStart`, so a tight symmetric window is reliably hittable.
+    uint256 public maxStrikeReportLag = 3 seconds;
+    /// @notice F-2026-17760: hard upper bound on either tunable observation lag. The owner can tune
+    ///         within `[0, OBSERVATION_LAG_CAP]` against the live fetcher but can never widen the
+    ///         window back to the exploitable 30s+ range beyond this ceiling.
+    uint256 public constant OBSERVATION_LAG_CAP = 30 seconds;
+    /// @notice F-2026-17729: strike `startTime` must be a multiple of this.
+    ///         Equal to the smallest timeframe duration (300s); the AutoCycler's
+    ///         {300, 900, 3600} durations are all multiples of it and every
+    ///         `plannedStart` is clock-aligned, so legitimate captures are
+    ///         unaffected while the per-second cache-key drain is closed.
+    uint256 public constant STRIKE_ALIGNMENT = 300;
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
     uint256 public constant OPTION_UP = 1;
     uint256 public constant OPTION_DOWN = 2;
@@ -245,11 +291,11 @@ contract ChainlinkResolver is Ownable {
     /// @notice Streams swap (2026-05-13): set the Data Streams feed-id
     ///         for a pair. Called once per supported pair after the
     ///         DON has allow-listed this contract for the corresponding
-    ///         stream. Markets created for a pair with an unconfigured
-    ///         streams feed-id can still be REGISTERED (the registration
-    ///         path only consults `priceFeeds` for strike validity) but
-    ///         will fail to RESOLVE with `StreamsFeedNotConfigured()`
-    ///         until this is set — loud failure mode, not silent.
+    ///         stream. `registerMarket` requires EITHER this streams feed-id
+    ///         OR a legacy `priceFeeds` aggregator to be set for the pair, so
+    ///         a Streams-only pair registers without a Data Feeds co-requisite;
+    ///         a market whose pair has a streams feed-id of zero still fails to
+    ///         RESOLVE with `StreamsFeedNotConfigured()` — loud, not silent.
     function configureStreamsFeed(bytes32 pairId, bytes32 feedId) external onlyOwner {
         streamsFeedId[pairId] = feedId;
         emit StreamsFeedConfigured(pairId, feedId);
@@ -271,11 +317,33 @@ contract ChainlinkResolver is Ownable {
         emit AuthorizedCallerSet(caller, authorized);
     }
 
+    /// @notice F-2026-17760: gate for `resolve` / `captureStrike`. The cycler (strike) and the
+    ///         resolver service (resolution) are set as authorized callers at deploy time.
+    modifier onlyAuthorized() {
+        if (!authorizedCallers[msg.sender] && msg.sender != owner()) revert NotAuthorizedCaller();
+        _;
+    }
+
+    /// @notice F-2026-17760: tune the observation windows against the live Data Streams fetcher.
+    ///         Both are hard-capped at `OBSERVATION_LAG_CAP` so the owner can tighten but never
+    ///         re-open the exploitable wide window.
+    function setObservationLag(uint256 resolveLag, uint256 strikeLag) external onlyOwner {
+        if (resolveLag > OBSERVATION_LAG_CAP) revert ObservationLagTooLarge(resolveLag, OBSERVATION_LAG_CAP);
+        if (strikeLag > OBSERVATION_LAG_CAP) revert ObservationLagTooLarge(strikeLag, OBSERVATION_LAG_CAP);
+        maxReportObservationLag = resolveLag;
+        maxStrikeReportLag = strikeLag;
+    }
+
     // ── Authorized: market registration ─────────────────────────────────
     function registerMarket(uint256 marketId, address settlement, bytes32 pairId, int256 strikePrice) external {
         require(authorizedCallers[msg.sender] || msg.sender == owner(), "unauthorized");
         if (settlement != trustedSettlement) revert TrustedSettlementMismatch();
-        if (priceFeeds[pairId] == address(0)) revert FeedNotConfigured();
+        // Streams-strike migration: the resolve/strike lifecycle now reads `streamsFeedId`, not the
+        // legacy Data Feeds `priceFeeds` aggregator. Gate on EITHER being configured so a Streams-only
+        // pair (the post-migration default — added via `addPair` + `configureStreamsFeed`, no
+        // `configureFeed`) is registerable, while a totally-unconfigured pair is still rejected. (Pre-
+        // fix this gated on `priceFeeds` alone, a hidden co-requisite that stuck new Streams-only pairs.)
+        if (priceFeeds[pairId] == address(0) && streamsFeedId[pairId] == bytes32(0)) revert FeedNotConfigured();
 
         IUpDownSettlement.Market memory sm = IUpDownSettlement(settlement).getMarket(marketId);
         if (sm.startTime == 0 || sm.pairId != pairId || int256(sm.strikePrice) != strikePrice) revert MarketNotRegistered();
@@ -329,15 +397,23 @@ contract ChainlinkResolver is Ownable {
     // leaving the longer-timeframe slots uncreated forever. The cached
     // return is also cheaper than a fresh verify (~4k gas vs ~150k).
     //
-    // Permissionless: any caller may submit a valid report for any pair
-    // at any startTime — the symmetric ±MAX_STRIKE_REPORT_LAG window and
-    // feedId binding bound what a malicious submitter could achieve to
-    // "capture the actual price near a real slot boundary," which is
-    // exactly the intended behavior.
+    // Access: `onlyAuthorized` (F-2026-17760) — the cycler captures strikes
+    // (and the owner may). Even so, the symmetric ±maxStrikeReportLag window
+    // and feedId binding bound what any submitter could achieve to "capture
+    // the actual price near a real slot boundary," which is the intended
+    // behavior; the access gate removes the prior permissionless LINK-drain
+    // and favorable-report surface (F-2026-17729 / 17760).
     function captureStrike(bytes32 pairId, bytes memory signedReport, uint64 startTime)
         external
+        onlyAuthorized
         returns (int256 strikePrice)
     {
+        // F-2026-17729: pin `startTime` to a real slot boundary before the
+        // dedup-cache check so an unaligned key can never trigger a paid
+        // verify. Checked first (even before the cache hit) so the function
+        // can only ever transact on aligned boundaries.
+        if (uint256(startTime) % STRIKE_ALIGNMENT != 0) revert StrikeStartNotAligned(startTime);
+
         if (strikeCaptured[pairId][startTime]) {
             return capturedStrike[pairId][startTime];
         }
@@ -362,9 +438,16 @@ contract ChainlinkResolver is Ownable {
         // slot boundary, settlement is anchored AT-OR-BEFORE close.
         uint256 obs = uint256(report.observationsTimestamp);
         uint256 startTs = uint256(startTime);
-        if (obs + MAX_STRIKE_REPORT_LAG < startTs || obs > startTs + MAX_STRIKE_REPORT_LAG) {
+        if (obs + maxStrikeReportLag < startTs || obs > startTs + maxStrikeReportLag) {
             revert ReportObservationOutOfStrikeWindow(startTime, obs);
         }
+
+        // F-2026-17759: reject a malformed (zero / negative) DON price on the
+        // live Streams path. The original sign guard lived only in the legacy
+        // `_getLatestPrice` (Data Feeds) view, which the post-Streams-migration
+        // strike path no longer uses — production captures the strike from
+        // `report.price` directly, so it gets the same positivity guard.
+        if (report.price <= 0) revert InvalidPrice();
 
         strikePrice = int256(report.price);
         strikeCaptured[pairId][startTime] = true;
@@ -408,17 +491,18 @@ contract ChainlinkResolver is Ownable {
     //      pattern as before — `ResolveFailed` event preserves the
     //      auditable failure path.
     //
-    // Permissionless and deterministic: any caller can submit any signed
-    // report, but only a report (a) for the right pair, (b) within the
-    // observation window, (c) not expired, and (d) signed by the DON will
-    // produce a successful resolve. Different reports observed within the
-    // 30s window yield ~identical prices for sub-second Crypto streams, so
-    // the determinism property is preserved in practice; the bracket is
-    // tight enough to prevent meaningful price manipulation. See
+    // Authorized + deterministic (F-2026-17760): only an authorized caller
+    // (the resolver service, or the owner) can submit, and only a report
+    // (a) for the right pair, (b) within the observation window, (c) not
+    // expired, and (d) signed by the DON produces a successful resolve. The
+    // window is now an owner-tunable `maxReportObservationLag` (default 3s,
+    // hard-capped at `OBSERVATION_LAG_CAP`); reports within it yield
+    // ~identical prices for sub-second Crypto streams, and the access gate
+    // removes the prior permissionless favorable-report front-run. See
     // `audit-fixes/DATA_STREAMS_INVESTIGATION.md` for the full design
     // rationale.
 
-    function resolve(uint256 marketId, bytes calldata signedReport) external {
+    function resolve(uint256 marketId, bytes calldata signedReport) external onlyAuthorized {
         MarketInfo storage info = markets[marketId];
         if (info.settlement == address(0)) revert MarketNotRegistered();
         if (info.resolved) revert AlreadyResolved();
@@ -456,9 +540,16 @@ contract ChainlinkResolver is Ownable {
         // close — caller should fetch a fresher one from the API.
         uint256 obs = uint256(report.observationsTimestamp);
         uint256 endTs = uint256(m.endTime);
-        if (obs > endTs || obs + MAX_REPORT_OBSERVATION_LAG < endTs) {
+        if (obs > endTs || obs + maxReportObservationLag < endTs) {
             revert ReportObservationOutOfWindow(endTs, obs);
         }
+
+        // F-2026-17759: reject a malformed (zero / negative) DON price on the
+        // live Streams path. The original sign guard lived only in the legacy
+        // `_getLatestPrice` (Data Feeds) view, which settlement no longer uses —
+        // production resolves the binary outcome from `report.price` directly,
+        // so it gets the same positivity guard before deciding UP/DOWN.
+        if (report.price <= 0) revert InvalidPrice();
 
         int256 settlementPrice = int256(report.price);
         uint256 winningOption = settlementPrice > info.strikePrice ? OPTION_UP : OPTION_DOWN;
@@ -539,6 +630,10 @@ contract ChainlinkResolver is Ownable {
 
         (, int256 price,, uint256 updatedAt,) = AggregatorV3Interface(feed).latestRoundData();
         if (block.timestamp - updatedAt > MAX_STALENESS) revert StalePrice();
+        // F-2026-17759: reject non-positive feed answers (0, negative, or a
+        // min/maxAnswer clamp surfaced as a sentinel) rather than forwarding
+        // them as a valid price.
+        if (price <= 0) revert InvalidPrice();
 
         return price;
     }
