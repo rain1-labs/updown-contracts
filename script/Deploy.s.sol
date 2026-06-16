@@ -26,7 +26,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///   DEPLOYER_PRIVATE_KEY            — the deployer/owner key
 ///   ARBITRUM_RPC_URL                — Arbitrum One RPC
 ///   USDT_ADDRESS                    — USDT token on the target network
-///   RELAYER_ADDRESS                 — relayer wallet that calls enterPosition / withdrawSettlement
+///   RELAYER_ADDRESS                 — relayer wallet that calls enterPosition / mint / redeemFor
 ///   TREASURY_ADDRESS                — treasury EOA that receives platformFee + funds rebate claims
 ///
 /// Optional env var (migration mode):
@@ -55,9 +55,12 @@ contract DeployUpDown is Script {
     bytes32 constant BTCUSD = keccak256("BTC/USD");
     bytes32 constant ETHUSD = keccak256("ETH/USD");
 
-    // ── Fee defaults (basis points) ─────────────────────────────────────
-    uint256 constant PLATFORM_FEE_BPS = 70;
-    uint256 constant MAKER_FEE_BPS = 80;
+    // ── Rebate budget defaults (F-2026-17779 rolling treasury circuit-breaker) ──
+    // Cap rebate claims to $5,000 / 7-day window by default. Ops tunes via
+    // `setRebateBudget`. A $0 budget would disable rebates entirely (fail-safe),
+    // so the deploy seeds a working non-zero default.
+    uint256 constant REBATE_BUDGET_PER_WINDOW = 5_000_000_000; // 5,000 USDT (6 decimals)
+    uint256 constant REBATE_WINDOW_DURATION = 7 days;
 
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -113,7 +116,9 @@ contract DeployUpDown is Script {
             settlement = UpDownSettlement(existingSettlement);
             console.log("UpDownSettlement (existing):", address(settlement));
         } else {
-            settlement = new UpDownSettlement(IERC20(usdt), deployer, PLATFORM_FEE_BPS, MAKER_FEE_BPS);
+            // F-2026-17746: fee bps removed from the constructor — fees are signed-and-capped
+            // per order, not derived from on-chain bps.
+            settlement = new UpDownSettlement(IERC20(usdt), deployer);
             console.log("UpDownSettlement (fresh):", address(settlement));
         }
 
@@ -146,8 +151,18 @@ contract DeployUpDown is Script {
         settlement.setAutocycler(address(cycler));
         settlement.setRelayer(relayer);
         settlement.setTreasury(treasury);
+        // F-2026-17779: seed the rolling rebate budget circuit-breaker.
+        settlement.setRebateBudget(REBATE_BUDGET_PER_WINDOW, REBATE_WINDOW_DURATION);
 
+        // F-2026-17760: the cycler captures strikes; the relayer (resolver service) submits
+        // resolutions. Both must be authorized now that resolve/captureStrike are access-gated.
         resolver.setAuthorizedCaller(address(cycler), true);
+        resolver.setAuthorizedCaller(relayer, true);
+
+        // F-2026-17726: gate performUpkeep to the keeper. The stopgap cron drives the cycler from
+        // the relayer wallet; once Chainlink Automation is registered, ops updates this to the
+        // Automation forwarder address via `setForwarder`.
+        cycler.setForwarder(relayer);
 
         // Whitelist + start cycling both pairs. In migration mode, the
         // NEW cycler has a fresh _cyclingPairs[] state and needs the same
