@@ -23,3 +23,6 @@ broadcast/
 # OS
 .DS_Store
 Thumbs.db
+
+docs/csco-reports/
+audit-repro/
