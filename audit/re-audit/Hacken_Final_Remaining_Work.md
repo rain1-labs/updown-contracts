@@ -25,9 +25,16 @@ existed. Every item below is Medium-or-lower.
 
 ## Implementation status (2026-07-06)
 
-The **four Pending-Fix items are IMPLEMENTED** in `src/UpDownSettlement.sol` (uncommitted).
+The **four Pending-Fix items are IMPLEMENTED** in `src/UpDownSettlement.sol`, committed as
+`5204fe8` on `audit/hacken-remediation-v2`.
 F-2026-17731 (already Hacken-accepted as *Mitigated*) is **deferred** — it needs cross-repo
 DMM-bot `maxFee` alignment and is optional (see the caveat below).
+
+> ⚠ **Deployment note:** the public demo's `UpDownSettlement` on Arbitrum One
+> (`0x35546D57ECCDBC0b33ae475f2C505A0f7F29a7ED`, at demo-pulsepairs.rainwins.com) was
+> deployed from the earlier commit `285987c` and therefore **predates these four fixes**
+> (`5204fe8` changes `UpDownSettlement` bytecode). All four are Low/Info severity; the
+> production redeploy after Hacken sign-off will carry them.
 
 | Finding | Change | Site |
 |---------|--------|------|
