@@ -570,6 +570,42 @@ contract UpDownUnit is Test {
         assertEq(uint256(m2.endTime), nextBoundary + 300);
     }
 
+    /// F-2026-17953: user-facing market actions must revert BEFORE a pre-positioned market's
+    /// startTime. Exercised via self-service `mint`; `enterPosition` / `burn` share the same guard.
+    function test_F17953_preStartInteractionsRevert() public {
+        uint256 ts = 1_234_567_890;
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
+        cycler.setPreStartWindowSec(30);
+
+        // Bootstrap market #1 at the current boundary, then create a FUTURE-start market #2.
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
+        UpDownSettlement.Market memory m1 = settlement.getMarket(1);
+        uint256 nextBoundary = uint256(m1.startTime) + 300;
+        vm.warp(nextBoundary - 25); // inside the pre-start window
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
+        UpDownSettlement.Market memory m2 = settlement.getMarket(2);
+        assertGt(uint256(m2.startTime), block.timestamp, "precondition: market #2 not yet open");
+
+        // Fund a minter on the settlement's own USDT.
+        ERC20Mock usdt = ERC20Mock(address(settlement.usdt()));
+        address minter = makeAddr("preStartMinter");
+        usdt.mint(minter, 100e18);
+        vm.prank(minter);
+        usdt.approve(address(settlement), type(uint256).max);
+
+        // Before startTime: mint reverts (F-2026-17953 lower bound).
+        vm.prank(minter);
+        vm.expectRevert(UpDownSettlement.MarketNotOpen.selector);
+        settlement.mint(2, 10e18);
+
+        // At exactly startTime: the same mint succeeds (boundary is inclusive).
+        vm.warp(uint256(m2.startTime));
+        vm.prank(minter);
+        settlement.mint(2, 10e18);
+        assertEq(settlement.marketRetained(2), 10e18, "mint succeeds once the market opens");
+    }
+
     function test_prePositioning_checkUpkeep_firesEarly() public {
         // checkUpkeep must signal "createNeeded" `preStartWindowSec` seconds
         // earlier than the slot boundary. Pre-fix it required `block.timestamp

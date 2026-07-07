@@ -73,6 +73,9 @@ contract UpDownPROInvariant is StdInvariant, Test {
                 assertEq(retained, down, "unresolved: retained == DOWN shares");
             } else {
                 assertEq(retained, s.optionShares(mid, m.winner), "resolved: retained == winning shares");
+                // F-2026-17954: the losing side is zeroed at resolution and never re-grows.
+                uint8 loser = m.winner == 1 ? 2 : 1;
+                assertEq(s.optionShares(mid, loser), 0, "resolved: loser shares zeroed (F-2026-17954)");
             }
         }
     }

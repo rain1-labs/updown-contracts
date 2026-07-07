@@ -400,6 +400,16 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         if (block.timestamp > mo.expiry || block.timestamp > to.expiry) revert OrderExpired();
         if (f.fillAmount == 0) revert FillExceedsOrderAmount();
 
+        // ── F-2026-17952 + F-2026-17953: market existence & open-window check, hoisted ABOVE
+        //     signature verification and all order-fill state writes. A fill against a
+        //     nonexistent / not-yet-open / ended market now reverts before any ECRECOVER or SSTORE,
+        //     and the added lower bound (`block.timestamp < startTime`) closes the pre-start window
+        //     so fills cannot execute before the published market start. ──
+        Market storage m = markets[mo.market];
+        if (m.startTime == 0) revert MarketNotOpen();
+        if (block.timestamp < uint256(m.startTime)) revert MarketNotOpen(); // F-2026-17953
+        if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
+
         // Execution price is the resting maker's price (price-time priority). Crossing check:
         // the buy side must be willing to pay ≥ the sell side's ask.
         uint256 buyPrice = mo.side == SIDE_BUY ? mo.price : to.price;
@@ -431,11 +441,6 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         _consumeOrder(makerHash, mo.amount, f.fillAmount);
         _consumeOrder(takerHash, to.amount, f.fillAmount);
         orderFeesPaid[takerHash] = takerFeesPaid;
-
-        // ── Market must be active. ──
-        Market storage m = markets[mo.market];
-        if (m.startTime == 0) revert MarketNotOpen();
-        if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
 
         // ── Resolve roles. taker is the aggressor (takerOrder.maker); buyer/seller by side. ──
         address taker = to.maker;
@@ -513,6 +518,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         if (minter == address(0)) revert ZeroAddress();
         Market storage m = markets[marketId];
         if (m.startTime == 0) revert MarketNotOpen();
+        if (block.timestamp < uint256(m.startTime)) revert MarketNotOpen(); // F-2026-17953
         if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
 
         usdt.safeTransferFrom(minter, address(this), amount);
@@ -546,6 +552,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         if (holder == address(0)) revert ZeroAddress();
         Market storage m = markets[marketId];
         if (m.startTime == 0) revert MarketNotOpen();
+        if (block.timestamp < uint256(m.startTime)) revert MarketNotOpen(); // F-2026-17953
         if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen(); // F-2026-17774
         if (m.resolved) revert AlreadyResolved();
 
@@ -599,6 +606,14 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         m.settlementPrice = int128(settlementPrice);
         m.winner = winner;
         m.resolved = true;
+
+        // F-2026-17954: the losing option's aggregate shares are worthless and unredeemable
+        // after resolution, but nothing else ever clears them. Zero the loser side here so
+        // off-chain consumers reading `optionShares` do not misread it as live supply. The
+        // winner side is decremented per redemption in `_redeemToAllowZero`.
+        uint8 loser = winner == OPTION_UP ? OPTION_DOWN : OPTION_UP;
+        optionShares[marketId][loser] = 0;
+
         emit MarketResolved(marketId, winner, int256(settlementPrice));
     }
 
@@ -654,9 +669,9 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///         `rebateBudgetPerWindow`, so even a standing treasury approval bounds a compromised
     ///         relayer to one window's budget. `rebateBudgetPerWindow == 0` (default) disables claims.
     function claimRebate() external nonReentrant {
-        uint256 amt = dmmRebateAccumulated[msg.sender];
-        if (amt == 0) return;
-        if (treasury == address(0)) revert TreasuryUnderFunded(amt, 0);
+        uint256 accrued = dmmRebateAccumulated[msg.sender];
+        if (accrued == 0) return;
+        if (treasury == address(0)) revert TreasuryUnderFunded(accrued, 0);
 
         // Roll the window forward lazily before checking the budget.
         uint256 windowDuration = rebateWindowDuration;
@@ -667,14 +682,21 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         uint256 remaining = rebateBudgetPerWindow > rebateClaimedInWindow
             ? rebateBudgetPerWindow - rebateClaimedInWindow
             : 0;
-        if (amt > remaining) revert RebateBudgetExceeded(amt, remaining);
+
+        // F-2026-17975: claim PARTIALLY up to the remaining window budget instead of an
+        // all-or-nothing revert. Previously, any accumulator larger than `rebateBudgetPerWindow`
+        // could never fit under `remaining` and became permanently unclaimable. Now the caller
+        // draws down as much as the window allows; the unclaimed remainder stays accrued for the
+        // next window. `remaining == 0` (budget disabled or window exhausted) still reverts.
+        uint256 amt = accrued < remaining ? accrued : remaining;
+        if (amt == 0) revert RebateBudgetExceeded(accrued, remaining);
 
         uint256 balance = usdt.balanceOf(treasury);
         uint256 allowance = usdt.allowance(treasury, address(this));
         uint256 have = balance < allowance ? balance : allowance;
         if (have < amt) revert TreasuryUnderFunded(amt, have);
 
-        dmmRebateAccumulated[msg.sender] = 0;
+        dmmRebateAccumulated[msg.sender] = accrued - amt;
         rebateClaimedInWindow += amt;
         usdt.safeTransferFrom(treasury, msg.sender, amt);
         emit RebateClaimed(msg.sender, amt);
@@ -720,8 +742,14 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     function setRebateBudget(uint256 budgetPerWindow, uint256 windowDuration) external onlyOwner {
         rebateBudgetPerWindow = budgetPerWindow;
         rebateWindowDuration = windowDuration;
-        rebateWindowStart = block.timestamp;
-        rebateClaimedInWindow = 0;
+        // F-2026-17975: do NOT reset the rolling-window counters on every reconfiguration.
+        // The old unconditional `rebateClaimedInWindow = 0` forgot rebates already claimed in the
+        // active window, letting the per-window cap be exceeded within the same period. Only seed
+        // `rebateWindowStart` the first time a budget is configured; thereafter `claimRebate` rolls
+        // the window forward lazily once `windowDuration` elapses.
+        if (rebateWindowStart == 0) {
+            rebateWindowStart = block.timestamp;
+        }
         emit RebateBudgetSet(budgetPerWindow, windowDuration);
     }
 

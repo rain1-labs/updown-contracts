@@ -496,9 +496,18 @@ contract RemediationV2Test is Test {
         vm.prank(relayer);
         s.accumulateRebate(bob.addr, 10_000e18);
 
-        // The on-chain budget caps the claim regardless of the standing approval.
+        // F-2026-17975: the claim is now PARTIAL — bob draws down at most the window budget
+        // (500e18), NOT the full 10_000e18. The per-window cap still bounds a compromised relayer
+        // to one window's budget despite the standing approval (the security property of F-17779),
+        // while the accumulator no longer freezes when it exceeds the cap (the F-17975 fix).
         vm.prank(bob.addr);
-        vm.expectRevert(abi.encodeWithSelector(UpDownSettlement.RebateBudgetExceeded.selector, 10_000e18, 500e18));
+        s.claimRebate();
+        assertEq(usdt.balanceOf(bob.addr), 1_000_000e18 + 500e18, "drew down exactly one window's budget");
+        assertEq(s.dmmRebateAccumulated(bob.addr), 9_500e18, "unclaimed remainder stays accrued");
+
+        // Same window is now exhausted → a second claim reverts (remaining == 0).
+        vm.prank(bob.addr);
+        vm.expectRevert(abi.encodeWithSelector(UpDownSettlement.RebateBudgetExceeded.selector, 9_500e18, 0));
         s.claimRebate();
     }
 
@@ -508,25 +517,133 @@ contract RemediationV2Test is Test {
         usdt.approve(address(s), type(uint256).max);
         s.setRebateBudget(500e18, 7 days);
 
-        // Within budget.
+        // Within budget: full claim.
         vm.prank(relayer);
         s.accumulateRebate(bob.addr, 400e18);
         vm.prank(bob.addr);
         s.claimRebate();
         assertEq(usdt.balanceOf(bob.addr), 1_000_000e18 + 400e18);
 
-        // Same window: only 100e18 of budget left → a 400e18 claim now exceeds it.
+        // Same window: only 100e18 of budget left. F-2026-17975: carol's 400e18 claim now draws
+        // the remaining 100e18 (partial) instead of reverting; 300e18 stays accrued for later.
         vm.prank(relayer);
         s.accumulateRebate(carol.addr, 400e18);
         vm.prank(carol.addr);
-        vm.expectRevert(abi.encodeWithSelector(UpDownSettlement.RebateBudgetExceeded.selector, 400e18, 100e18));
         s.claimRebate();
+        assertEq(usdt.balanceOf(carol.addr), 1_000_000e18 + 100e18, "partial: drew the remaining window budget");
+        assertEq(s.dmmRebateAccumulated(carol.addr), 300e18, "unclaimed remainder carried to next window");
 
-        // Next window: budget resets.
+        // Next window: the lazy roll refreshes the budget; carol draws her 300e18 remainder.
         vm.warp(block.timestamp + 7 days + 1);
         vm.prank(carol.addr);
         s.claimRebate();
-        assertEq(usdt.balanceOf(carol.addr), 1_000_000e18 + 400e18);
+        assertEq(usdt.balanceOf(carol.addr), 1_000_000e18 + 400e18, "remainder claimable next window");
+        assertEq(s.dmmRebateAccumulated(carol.addr), 0, "fully drained across two windows");
+    }
+
+    /// F-2026-17975: an accumulator larger than the per-window cap is NOT frozen — it is drawn
+    /// down partially each window until exhausted, rather than reverting all-or-nothing forever.
+    function test_F17975_oversizedAccumulatorDrainsAcrossWindows() public {
+        usdt.mint(treasury, 1_000_000e18);
+        vm.prank(treasury);
+        usdt.approve(address(s), type(uint256).max);
+        s.setRebateBudget(500e18, 7 days);
+
+        // Accrue 1_200e18 — 2.4× the per-window budget. Pre-fix this was permanently unclaimable.
+        vm.prank(relayer);
+        s.accumulateRebate(bob.addr, 1_200e18);
+
+        // Monotonic clock: each window advances the timestamp well past `windowDuration` so the
+        // lazy roll in `claimRebate` refreshes the budget (avoids re-reading block.timestamp after
+        // an intervening roll, which would land back on the just-set rebateWindowStart).
+        uint256 t = block.timestamp;
+
+        // Window 1: 500e18.
+        vm.prank(bob.addr);
+        s.claimRebate();
+        assertEq(s.dmmRebateAccumulated(bob.addr), 700e18);
+        // Window 2: 500e18.
+        t += 8 days;
+        vm.warp(t);
+        vm.prank(bob.addr);
+        s.claimRebate();
+        assertEq(s.dmmRebateAccumulated(bob.addr), 200e18);
+        // Window 3: final 200e18 (< budget → full drain).
+        t += 8 days;
+        vm.warp(t);
+        vm.prank(bob.addr);
+        s.claimRebate();
+        assertEq(s.dmmRebateAccumulated(bob.addr), 0, "fully drained after three windows");
+        assertEq(usdt.balanceOf(bob.addr), 1_000_000e18 + 1_200e18, "received the whole accrued rebate");
+    }
+
+    /// F-2026-17975: reconfiguring the budget mid-window must NOT reset the claimed-in-window
+    /// counter (the old code did, reopening the cap and letting the same window pay out twice).
+    function test_F17975_reconfigureDoesNotReopenWindowCap() public {
+        usdt.mint(treasury, 1_000_000e18);
+        vm.prank(treasury);
+        usdt.approve(address(s), type(uint256).max);
+        s.setRebateBudget(500e18, 7 days);
+
+        // Bob consumes the full window budget.
+        vm.prank(relayer);
+        s.accumulateRebate(bob.addr, 500e18);
+        vm.prank(bob.addr);
+        s.claimRebate();
+        assertEq(s.rebateClaimedInWindow(), 500e18, "window fully consumed");
+
+        // Owner reconfigures the budget MID-WINDOW (same duration). Pre-fix: rebateClaimedInWindow
+        // reset to 0 → cap reopened. Post-fix: the counter is preserved and the window stays closed.
+        s.setRebateBudget(500e18, 7 days);
+        assertEq(s.rebateClaimedInWindow(), 500e18, "F-2026-17975: reconfigure preserves claimed-in-window");
+
+        vm.prank(relayer);
+        s.accumulateRebate(carol.addr, 500e18);
+        vm.prank(carol.addr);
+        vm.expectRevert(abi.encodeWithSelector(UpDownSettlement.RebateBudgetExceeded.selector, 500e18, 0));
+        s.claimRebate();
+    }
+
+    /// F-2026-17954: the losing option's aggregate shares are zeroed at resolution so off-chain
+    /// consumers do not misread the loser side as live supply. The winner side is untouched.
+    function test_F17954_resolveZerosLoserOptionShares() public {
+        uint256 mid = _market();
+        vm.prank(alice.addr);
+        s.mint(mid, 100e18);
+        assertEq(s.optionShares(mid, UP), 100e18);
+        assertEq(s.optionShares(mid, DOWN), 100e18);
+
+        UpDownSettlement.Market memory m = s.getMarket(mid);
+        vm.warp(uint256(m.endTime));
+        vm.prank(resolver);
+        s.resolve(mid, 60_000e8, UP); // UP wins
+
+        assertEq(s.optionShares(mid, DOWN), 0, "F-2026-17954: loser (DOWN) shares zeroed at resolve");
+        assertEq(s.optionShares(mid, UP), 100e18, "winner (UP) shares intact until redeemed");
+    }
+
+    /// F-2026-17952: the market existence check is hoisted ABOVE signature verification. This test
+    /// proves the ordering: the orders target a market that was never created (startTime == 0) AND
+    /// carry INVALID signatures (signed by the wrong key). Pre-fix, signature verification ran first
+    /// → the call would revert InvalidSignature; post-fix, the hoisted existence check fires first →
+    /// MarketNotOpen. Asserting MarketNotOpen therefore fails on the un-hoisted (pre-fix) code, so
+    /// this is a genuine regression guard for the reorder rather than a tautology.
+    function test_F17952_marketCheckPrecedesSignatureVerification() public {
+        uint256 ghost = 999; // never created → markets[ghost].startTime == 0
+        UpDownSettlement.Order memory makerO = _order(alice, ghost, UP, SELL, 6000, 100e18, 0, 1);
+        UpDownSettlement.Order memory takerO = _order(bob, ghost, UP, BUY, 6000, 100e18, 10e18, 2);
+        UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
+            makerOrder: makerO,
+            makerSignature: _sign(bob, makerO), // wrong signer → recovers to bob, not maker alice → invalid
+            takerSignature: _sign(alice, takerO), // wrong signer → recovers to alice, not taker bob → invalid
+            takerOrder: takerO,
+            fillAmount: 100e18,
+            platformFee: 0,
+            makerFee: 0
+        });
+        vm.prank(relayer);
+        vm.expectRevert(UpDownSettlement.MarketNotOpen.selector); // pre-fix this would be InvalidSignature
+        s.enterPosition(f);
     }
 
     // ─────────────────────────────────────────────────────────────────────
