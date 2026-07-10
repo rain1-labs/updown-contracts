@@ -10,5 +10,14 @@ optimizer_runs = 200
 [profile.default.fmt]
 line_length = 120
 
+# Gate 3 real-DON fork test only. Inherits the default profile's compiler
+# settings and adds `ffi = true` so `UpDownForkTest` can shell out to
+# `script/fetch_streams_report.mjs`. Kept OUT of the default profile so the
+# audited CI suite never runs with ffi enabled.
+#   FOUNDRY_PROFILE=fork forge test --match-contract UpDownForkTest -vvv
+[profile.fork]
+ffi = true
+
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"
+arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
