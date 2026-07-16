@@ -42,12 +42,14 @@ contract UpDownPROInvariant is StdInvariant, Test {
         handler.bootstrap();
 
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](5);
+        bytes4[] memory selectors = new bytes4[](7);
         selectors[0] = handler.fuzzMint.selector;
         selectors[1] = handler.fuzzBurn.selector;
         selectors[2] = handler.fuzzFill.selector;
         selectors[3] = handler.fuzzResolve.selector;
         selectors[4] = handler.fuzzRedeem.selector;
+        selectors[5] = handler.fuzzMintMatch.selector;
+        selectors[6] = handler.fuzzMergeMatch.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -196,6 +198,76 @@ contract ShareHandler is Test {
         });
         vm.prank(relayer);
         s.enterPosition(f);
+    }
+
+    // ── MINT match: two BUYers on opposite options, priced so p_up + p_down >= 10000. ──
+    function fuzzMintMatch(uint256 marketIdx, uint256 aIdx, uint256 bIdx, uint16 upPriceBps, uint256 fillAmount)
+        external
+    {
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory upBuyer = wallets[aIdx % wallets.length];
+        Vm.Wallet memory downBuyer = wallets[bIdx % wallets.length];
+        if (upBuyer.addr == downBuyer.addr) return;
+
+        uint256 pUp = bound(uint256(upPriceBps), 1, 9999);
+        uint256 pDown = 10000 - pUp; // crossing at the boundary (sum == 10000)
+        fillAmount = bound(fillAmount, 1, 1_000e18);
+        uint256 upCash = (pUp * fillAmount) / 10000;
+        uint256 downCash = fillAmount - upCash;
+        if (usdt.balanceOf(upBuyer.addr) < upCash || usdt.balanceOf(downBuyer.addr) < downCash) return;
+
+        UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
+            maker: upBuyer.addr, market: mid, option: 1, side: 0, orderType: 0,
+            price: pUp, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
+            maker: downBuyer.addr, market: mid, option: 2, side: 0, orderType: 0,
+            price: pDown, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
+            makerOrder: makerOrder, makerSignature: _sign(upBuyer, makerOrder),
+            takerOrder: takerOrder, takerSignature: _sign(downBuyer, takerOrder),
+            fillAmount: fillAmount, platformFee: 0, makerFee: 0
+        });
+        vm.prank(relayer);
+        s.mintMatch(f);
+    }
+
+    // ── MERGE match: two SELLers on opposite options who hold the shares, p_up + p_down <= 10000. ──
+    function fuzzMergeMatch(uint256 marketIdx, uint256 aIdx, uint256 bIdx, uint16 upPriceBps, uint256 fillAmount)
+        external
+    {
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory upSeller = wallets[aIdx % wallets.length];
+        Vm.Wallet memory downSeller = wallets[bIdx % wallets.length];
+        if (upSeller.addr == downSeller.addr) return;
+
+        uint256 upHeld = s.sharesOf(mid, upSeller.addr, 1);
+        uint256 downHeld = s.sharesOf(mid, downSeller.addr, 2);
+        uint256 maxFill = upHeld < downHeld ? upHeld : downHeld;
+        if (maxFill == 0) return;
+        fillAmount = bound(fillAmount, 1, maxFill);
+
+        uint256 pUp = bound(uint256(upPriceBps), 1, 9999);
+        uint256 pDown = 10000 - pUp; // sum == 10000, the crossing boundary for a merge
+
+        UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
+            maker: upSeller.addr, market: mid, option: 1, side: 1, orderType: 0,
+            price: pUp, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
+            maker: downSeller.addr, market: mid, option: 2, side: 1, orderType: 0,
+            price: pDown, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
+            makerOrder: makerOrder, makerSignature: _sign(upSeller, makerOrder),
+            takerOrder: takerOrder, takerSignature: _sign(downSeller, takerOrder),
+            fillAmount: fillAmount, platformFee: 0, makerFee: 0
+        });
+        vm.prank(relayer);
+        s.mergeMatch(f);
     }
 
     function fuzzResolve(uint256 marketIdx, uint8 winner) external {

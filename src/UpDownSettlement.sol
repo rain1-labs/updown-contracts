@@ -68,6 +68,16 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     /// @notice F-2026-17779: a `claimRebate` would exceed the rolling per-window rebate budget.
     error RebateBudgetExceeded(uint256 want, uint256 remaining);
     error NothingToRedeem();
+    /// @notice Complementary matching: `mintMatch` requires two BUY orders; `mergeMatch` two SELL
+    ///         orders. Raised when a leg has the wrong side for the requested complementary match.
+    error NotBothBuys();
+    error NotBothSells();
+    /// @notice Complementary matching: the two legs must be on opposite options — exactly one UP
+    ///         (1) and one DOWN (2). Raised when they are equal or not a valid {UP,DOWN} pair.
+    error NotComplementary();
+    /// @notice Complementary matching: a signed price is outside the valid bps range [0, 10000],
+    ///         which would break the maker/taker cash split. Prices are basis points of $1.
+    error PriceOutOfRange();
 
     // ── Types ───────────────────────────────────────────────────────────
     /// @dev Packed for cheaper `createMarket`. Layout is UNCHANGED from V1 so the
@@ -177,6 +187,35 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     event ComplementaryBurned(uint256 indexed marketId, address indexed holder, uint256 amount);
     /// @notice F-2026-17778: trustless redemption. `to` is always the share owner — never the relayer.
     event Redeemed(uint256 indexed marketId, address indexed holder, uint8 winner, uint256 payout);
+    /// @notice Complementary matching: two BUY orders on opposite options crossed by MINTING a fresh
+    ///         complete set. `upCash` / `downCash` are what each buyer paid into backing (they sum to
+    ///         `fillAmount`). `platformFee` / `makerFee` are the taker-paid fees (peer-to-peer, never
+    ///         touching backing), included so a mint-fill's full settlement — including fee flow — is
+    ///         reconstructable from this event alone, matching the `FillSettled` guarantee for
+    ///         `enterPosition`. Emitted alongside a `PositionEntered` per leg so share indexers stay uniform.
+    event MintMatched(
+        uint256 indexed marketId,
+        address indexed upBuyer,
+        address indexed downBuyer,
+        uint256 fillAmount,
+        uint256 upCash,
+        uint256 downCash,
+        address taker,
+        uint256 platformFee,
+        uint256 makerFee
+    );
+    /// @notice Complementary matching: two SELL orders on opposite options crossed by BURNING a
+    ///         complete set. `upProceeds` / `downProceeds` are what each seller received (they sum to
+    ///         `fillAmount`).
+    event MergeMatched(
+        uint256 indexed marketId,
+        address indexed upSeller,
+        address indexed downSeller,
+        uint256 fillAmount,
+        uint256 upProceeds,
+        uint256 downProceeds,
+        address taker
+    );
 
     // ── Immutables / roles ─────────────────────────────────────────────
     IERC20 public immutable usdt;
@@ -486,6 +525,202 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         uint256 newFilled = orderFills[orderHash] + fillAmount;
         if (newFilled > signedAmount) revert FillExceedsOrderAmount();
         orderFills[orderHash] = newFilled;
+    }
+
+    /// @dev The two legs of a complementary match must be on OPPOSITE options — exactly one UP (1)
+    ///      and one DOWN (2). Reverts otherwise (equal options, or an out-of-range option value).
+    function _requireComplementary(uint256 optA, uint256 optB) internal pure {
+        bool ok = (optA == OPTION_UP && optB == OPTION_DOWN) || (optA == OPTION_DOWN && optB == OPTION_UP);
+        if (!ok) revert NotComplementary();
+    }
+
+    // ── Complementary matching: MINT / MERGE (buy-UP ⇄ buy-DOWN, sell-UP ⇄ sell-DOWN) ───
+    //
+    // These make the two option books trade against each other so pure buy-side (or sell-side)
+    // demand can cross without either party pre-holding shares — the "buy UP = sell DOWN" duality
+    // realised in the engine. They are the Polymarket CTF-Exchange MINT/MERGE operations:
+    //
+    //   MINT  : one BUY UP + one BUY DOWN, priced so `p_up + p_down ≥ 10000`. A fresh complete set
+    //           is minted; the UP buyer gets UP shares, the DOWN buyer gets DOWN shares, and their
+    //           combined cash (== `fillAmount`) backs the set. Mirror of `enterPosition`'s consent /
+    //           fee model: both Orders are EIP-712-verified, execution is pegged to the resting
+    //           maker's price (price-time priority), and the taker pays the fee capped by `maxFee`.
+    //   MERGE : one SELL UP + one SELL DOWN, priced so `p_up + p_down ≤ 10000`. Both sellers'
+    //           shares burn a complete set; the released `fillAmount` USDT is split by price. Both
+    //           sellers must already hold the shares (share-covered, like every SELL).
+    //
+    // Balance invariant is preserved by construction: MINT raises `usdt.balanceOf(this)` by exactly
+    // `fillAmount` (== the `marketRetained` increase); MERGE lowers both by exactly `fillAmount`.
+
+    /// @notice Settle a MINT match between two signed BUY orders on opposite options. `f.makerOrder`
+    ///         is the resting BUY, `f.takerOrder` the aggressing BUY (either may be the UP leg).
+    ///         Fees are pulled from the taker and capped cumulatively by `takerOrder.maxFee`, exactly
+    ///         as in `enterPosition`; a resting maker pays no fee.
+    function mintMatch(FillInputs calldata f) external nonReentrant whenNotPaused onlyRelayer {
+        Order calldata mo = f.makerOrder;
+        Order calldata to = f.takerOrder;
+
+        // ── Geometry: both BUY, same market, opposite options, crossing, unexpired, nonzero fill. ──
+        if (mo.market != to.market) revert MarketMismatch();
+        if (mo.side != SIDE_BUY || to.side != SIDE_BUY) revert NotBothBuys();
+        _requireComplementary(mo.option, to.option);
+        if (mo.price > 10000 || to.price > 10000) revert PriceOutOfRange();
+        // MINT crossing: the two buyers together must fund the full $1 set.
+        if (mo.price + to.price < 10000) revert OrdersNotCrossed();
+        if (block.timestamp > mo.expiry || block.timestamp > to.expiry) revert OrderExpired();
+        if (f.fillAmount == 0) revert FillExceedsOrderAmount();
+
+        // ── Market existence & open window (hoisted above sigs/state, mirroring enterPosition). ──
+        Market storage m = markets[mo.market];
+        if (m.startTime == 0) revert MarketNotOpen();
+        if (block.timestamp < uint256(m.startTime)) revert MarketNotOpen();
+        if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
+
+        // ── Verify BOTH order signatures (EOA + ERC-1271). No MintAuth: the Orders are the consent. ──
+        bytes32 makerHash = hashOrder(mo);
+        bytes32 takerHash = hashOrder(to);
+        if (!SignatureChecker.isValidSignatureNow(mo.maker, _hashTypedDataV4(makerHash), f.makerSignature)) {
+            revert InvalidSignature();
+        }
+        if (!SignatureChecker.isValidSignatureNow(to.maker, _hashTypedDataV4(takerHash), f.takerSignature)) {
+            revert InvalidSignature();
+        }
+
+        // ── Fees: taker pays, capped CUMULATIVELY by the taker's signed maxFee (F-2026-17731). ──
+        uint256 feeTotal = f.platformFee + f.makerFee;
+        uint256 takerFeesPaid = orderFeesPaid[takerHash] + feeTotal;
+        if (takerFeesPaid > to.maxFee) revert FeeExceedsTakerCap(takerFeesPaid, to.maxFee);
+        if (f.platformFee > 0 && treasury == address(0)) revert TreasuryNotConfigured();
+
+        // ── Partial-fill bookkeeping for BOTH orders (shared with enterPosition via orderFills). ──
+        _consumeOrder(makerHash, mo.amount, f.fillAmount);
+        _consumeOrder(takerHash, to.amount, f.fillAmount);
+        orderFeesPaid[takerHash] = takerFeesPaid;
+
+        // ── Execution pegged to the resting maker's price (price-time priority). The maker pays its
+        //     signed price; the taker covers the complement so the set is fully backed. Any sub-unit
+        //     rounding lands on the taker and flows into backing — never to the platform. ──
+        uint256 makerCash = (mo.price * f.fillAmount) / 10000;
+        uint256 takerCash = f.fillAmount - makerCash;
+
+        // ── Pull both buyers' cash into the pool; retain the whole set as backing. Guard the
+        //     zero-value legs (a boundary price of 0 makes one leg 0) so a settlement token that
+        //     reverts on zero-value transfers cannot brick an otherwise-valid match — mirroring the
+        //     `> 0` guards in enterPosition and mergeMatch. ──
+        if (makerCash > 0) usdt.safeTransferFrom(mo.maker, address(this), makerCash);
+        if (takerCash > 0) usdt.safeTransferFrom(to.maker, address(this), takerCash);
+        marketRetained[mo.market] += f.fillAmount;
+
+        // ── Credit each buyer their own option's shares; both option supplies grow by the set size. ──
+        userShares[mo.market][mo.maker][uint8(mo.option)] += f.fillAmount;
+        userShares[mo.market][to.maker][uint8(to.option)] += f.fillAmount;
+        optionShares[mo.market][OPTION_UP] += f.fillAmount;
+        optionShares[mo.market][OPTION_DOWN] += f.fillAmount;
+
+        // ── Fees pulled from the taker (contract balance untouched by the fee transfers). ──
+        if (f.platformFee > 0) usdt.safeTransferFrom(to.maker, treasury, f.platformFee);
+        if (f.makerFee > 0) usdt.safeTransferFrom(to.maker, mo.maker, f.makerFee);
+
+        // ── Resolve UP vs DOWN leg for events / analytics. ──
+        address upBuyer;
+        address downBuyer;
+        uint256 upCash;
+        uint256 downCash;
+        if (mo.option == OPTION_UP) {
+            upBuyer = mo.maker;
+            upCash = makerCash;
+            downBuyer = to.maker;
+            downCash = takerCash;
+        } else {
+            upBuyer = to.maker;
+            upCash = takerCash;
+            downBuyer = mo.maker;
+            downCash = makerCash;
+        }
+
+        m.cashUpFlow += uint128(f.fillAmount);
+        m.cashDownFlow += uint128(f.fillAmount);
+
+        emit PositionEntered(mo.market, OPTION_UP, f.fillAmount, upBuyer);
+        emit PositionEntered(mo.market, OPTION_DOWN, f.fillAmount, downBuyer);
+        emit MintMatched(mo.market, upBuyer, downBuyer, f.fillAmount, upCash, downCash, to.maker, f.platformFee, f.makerFee);
+    }
+
+    /// @notice Settle a MERGE match between two signed SELL orders on opposite options. `f.makerOrder`
+    ///         is the resting SELL, `f.takerOrder` the aggressing SELL (either may be the UP leg). A
+    ///         complete set is burned and the released $1/share is split by the two signed prices.
+    ///         Zero-fee: both parties receive cash, so there is no taker inflow to source a fee from;
+    ///         `platformFee` / `makerFee` MUST be zero.
+    function mergeMatch(FillInputs calldata f) external nonReentrant whenNotPaused onlyRelayer {
+        Order calldata mo = f.makerOrder;
+        Order calldata to = f.takerOrder;
+
+        // ── Geometry: both SELL, same market, opposite options, crossing, unexpired, nonzero fill. ──
+        if (mo.market != to.market) revert MarketMismatch();
+        if (mo.side != SIDE_SELL || to.side != SIDE_SELL) revert NotBothSells();
+        _requireComplementary(mo.option, to.option);
+        if (mo.price > 10000 || to.price > 10000) revert PriceOutOfRange();
+        // MERGE crossing: the two sellers together may claim at most the $1 the burn releases.
+        if (mo.price + to.price > 10000) revert OrdersNotCrossed();
+        if (block.timestamp > mo.expiry || block.timestamp > to.expiry) revert OrderExpired();
+        if (f.fillAmount == 0) revert FillExceedsOrderAmount();
+        // MERGE pays both sellers from released backing — there is no taker cash inflow to fee.
+        if (f.platformFee != 0 || f.makerFee != 0) revert FeeBreakdownInvalid();
+
+        Market storage m = markets[mo.market];
+        if (m.startTime == 0) revert MarketNotOpen();
+        if (block.timestamp < uint256(m.startTime)) revert MarketNotOpen();
+        if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
+
+        bytes32 makerHash = hashOrder(mo);
+        bytes32 takerHash = hashOrder(to);
+        if (!SignatureChecker.isValidSignatureNow(mo.maker, _hashTypedDataV4(makerHash), f.makerSignature)) {
+            revert InvalidSignature();
+        }
+        if (!SignatureChecker.isValidSignatureNow(to.maker, _hashTypedDataV4(takerHash), f.takerSignature)) {
+            revert InvalidSignature();
+        }
+
+        _consumeOrder(makerHash, mo.amount, f.fillAmount);
+        _consumeOrder(takerHash, to.amount, f.fillAmount);
+
+        // ── Each seller must hold their own option's shares; burn the complete set. ──
+        uint8 makerOpt = uint8(mo.option);
+        uint8 takerOpt = uint8(to.option);
+        uint256 makerHeld = userShares[mo.market][mo.maker][makerOpt];
+        if (makerHeld < f.fillAmount) revert InsufficientShares(mo.market, makerOpt, f.fillAmount, makerHeld);
+        uint256 takerHeld = userShares[mo.market][to.maker][takerOpt];
+        if (takerHeld < f.fillAmount) revert InsufficientShares(mo.market, takerOpt, f.fillAmount, takerHeld);
+
+        userShares[mo.market][mo.maker][makerOpt] = makerHeld - f.fillAmount;
+        userShares[mo.market][to.maker][takerOpt] = takerHeld - f.fillAmount;
+        optionShares[mo.market][OPTION_UP] -= f.fillAmount;
+        optionShares[mo.market][OPTION_DOWN] -= f.fillAmount;
+        marketRetained[mo.market] -= f.fillAmount;
+
+        // ── Payout pegged to the resting maker's price; taker receives the complement. Sum == fill. ──
+        uint256 makerProceeds = (mo.price * f.fillAmount) / 10000;
+        uint256 takerProceeds = f.fillAmount - makerProceeds;
+        if (makerProceeds > 0) usdt.safeTransfer(mo.maker, makerProceeds);
+        if (takerProceeds > 0) usdt.safeTransfer(to.maker, takerProceeds);
+
+        address upSeller;
+        address downSeller;
+        uint256 upProceeds;
+        uint256 downProceeds;
+        if (mo.option == OPTION_UP) {
+            upSeller = mo.maker;
+            upProceeds = makerProceeds;
+            downSeller = to.maker;
+            downProceeds = takerProceeds;
+        } else {
+            upSeller = to.maker;
+            upProceeds = takerProceeds;
+            downSeller = mo.maker;
+            downProceeds = makerProceeds;
+        }
+
+        emit MergeMatched(mo.market, upSeller, downSeller, f.fillAmount, upProceeds, downProceeds, to.maker);
     }
 
     // ── Complementary mint / burn (F-2026-17772) ────────────────────────
