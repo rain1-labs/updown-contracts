@@ -445,6 +445,34 @@ contract SettlementBatchTest is Test {
         assertEq(s.sharesOf(mid, seller.addr, UP), 200e18, "seller kept all shares");
     }
 
+    function test_enterPositionBatch_onlyRelayer() public {
+        uint256 mid = _market();
+        Vm.Wallet memory seller = _wallet("epor_s");
+        Vm.Wallet memory buyer = _wallet("epor_b");
+        _mintSet(seller, mid, 100e18);
+        UpDownSettlement.Order memory makerSell = _order(seller, mid, UP, SELL, 6000, 100e18, 0, 1);
+        UpDownSettlement.Order memory takerBuy = _order(buyer, mid, UP, BUY, 6000, 100e18, 5e18, 2);
+        UpDownSettlement.FillInputs[] memory fs = new UpDownSettlement.FillInputs[](1);
+        fs[0] = _inputs(makerSell, seller, takerBuy, buyer, 100e18, 0, 0);
+        vm.expectRevert(UpDownSettlement.OnlyRelayer.selector);
+        s.enterPositionBatch(fs); // not pranked as relayer
+    }
+
+    function test_enterPositionBatch_whenPaused_reverts() public {
+        uint256 mid = _market();
+        Vm.Wallet memory seller = _wallet("eppz_s");
+        Vm.Wallet memory buyer = _wallet("eppz_b");
+        _mintSet(seller, mid, 100e18);
+        UpDownSettlement.Order memory makerSell = _order(seller, mid, UP, SELL, 6000, 100e18, 0, 1);
+        UpDownSettlement.Order memory takerBuy = _order(buyer, mid, UP, BUY, 6000, 100e18, 5e18, 2);
+        UpDownSettlement.FillInputs[] memory fs = new UpDownSettlement.FillInputs[](1);
+        fs[0] = _inputs(makerSell, seller, takerBuy, buyer, 100e18, 0, 0);
+        s.setPaused(true);
+        vm.prank(relayer);
+        vm.expectRevert(UpDownSettlement.Paused.selector);
+        s.enterPositionBatch(fs);
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     //                          MERGE MATCH — BATCH
     // ─────────────────────────────────────────────────────────────────────
@@ -507,6 +535,36 @@ contract SettlementBatchTest is Test {
 
         assertEq(s.sharesOf(mid, u0.addr, UP), 100e18, "valid fill 0's UP seller unchanged");
         assertEq(usdt.balanceOf(address(s)), sBal0, "no backing released");
+    }
+
+    function test_mergeMatchBatch_onlyRelayer() public {
+        uint256 mid = _market();
+        Vm.Wallet memory upSeller = _wallet("mgor_u");
+        Vm.Wallet memory dnSeller = _wallet("mgor_d");
+        _mintSet(upSeller, mid, 100e18);
+        _mintSet(dnSeller, mid, 100e18);
+        UpDownSettlement.Order memory upSell = _order(upSeller, mid, UP, SELL, 6000, 100e18, 0, 1);
+        UpDownSettlement.Order memory dnSell = _order(dnSeller, mid, DOWN, SELL, 3000, 100e18, 0, 2);
+        UpDownSettlement.FillInputs[] memory fs = new UpDownSettlement.FillInputs[](1);
+        fs[0] = _inputs(upSell, upSeller, dnSell, dnSeller, 100e18, 0, 0);
+        vm.expectRevert(UpDownSettlement.OnlyRelayer.selector);
+        s.mergeMatchBatch(fs); // not pranked as relayer
+    }
+
+    function test_mergeMatchBatch_whenPaused_reverts() public {
+        uint256 mid = _market();
+        Vm.Wallet memory upSeller = _wallet("mgpz_u");
+        Vm.Wallet memory dnSeller = _wallet("mgpz_d");
+        _mintSet(upSeller, mid, 100e18);
+        _mintSet(dnSeller, mid, 100e18);
+        UpDownSettlement.Order memory upSell = _order(upSeller, mid, UP, SELL, 6000, 100e18, 0, 1);
+        UpDownSettlement.Order memory dnSell = _order(dnSeller, mid, DOWN, SELL, 3000, 100e18, 0, 2);
+        UpDownSettlement.FillInputs[] memory fs = new UpDownSettlement.FillInputs[](1);
+        fs[0] = _inputs(upSell, upSeller, dnSell, dnSeller, 100e18, 0, 0);
+        s.setPaused(true);
+        vm.prank(relayer);
+        vm.expectRevert(UpDownSettlement.Paused.selector);
+        s.mergeMatchBatch(fs);
     }
 
     // ─────────────────────────────────────────────────────────────────────
