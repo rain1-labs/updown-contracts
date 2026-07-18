@@ -426,6 +426,30 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///         USDT balance is untouched, so the conservation invariant
     ///         `usdt.balanceOf(this) == Σ marketRetained` is preserved by construction.
     function enterPosition(FillInputs calldata f) external nonReentrant whenNotPaused onlyRelayer {
+        _enterPosition(f);
+    }
+
+    /// @notice Batch-settle up to N `enterPosition` fills in ONE transaction. The guard modifiers
+    ///         (`nonReentrant` / `whenNotPaused` / `onlyRelayer`) are evaluated ONCE for the whole
+    ///         batch; every fill is validated and settled independently by `_enterPosition`, exactly
+    ///         as the single-fill path does. All-or-nothing: if ANY fill reverts, the whole batch
+    ///         reverts and no state persists — so the relayer bisects the group / falls back to the
+    ///         single-fill entrypoint for the poison fill. Emits the same per-fill `PositionEntered`
+    ///         / `FillSettled` events as the single path, so off-chain indexers need no change. This
+    ///         is the throughput lever: collapsing the tx count (not the gas) is what lifts the
+    ///         single-relayer settlement ceiling.
+    function enterPositionBatch(FillInputs[] calldata fs) external nonReentrant whenNotPaused onlyRelayer {
+        uint256 len = fs.length;
+        for (uint256 i; i < len; ++i) {
+            _enterPosition(fs[i]);
+        }
+    }
+
+    /// @dev Body of a single `enterPosition` fill, extracted verbatim so the single-fill wrapper and
+    ///      `enterPositionBatch` share one implementation. Carries NO guard modifiers — its callers
+    ///      apply `nonReentrant` / `whenNotPaused` / `onlyRelayer` once. Depends only on `f` and
+    ///      storage, never on `msg.sender`, so batching is behaviour-preserving.
+    function _enterPosition(FillInputs calldata f) internal {
         Order calldata mo = f.makerOrder;
         Order calldata to = f.takerOrder;
 
@@ -557,6 +581,24 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///         Fees are pulled from the taker and capped cumulatively by `takerOrder.maxFee`, exactly
     ///         as in `enterPosition`; a resting maker pays no fee.
     function mintMatch(FillInputs calldata f) external nonReentrant whenNotPaused onlyRelayer {
+        _mintMatch(f);
+    }
+
+    /// @notice Batch-settle up to N `mintMatch` fills in ONE transaction — the demo's HOT settlement
+    ///         path (complementary matching). The guard modifiers run ONCE for the whole batch; each
+    ///         fill settles independently via `_mintMatch`. All-or-nothing (see `enterPositionBatch`
+    ///         for the rationale and the relayer's bisect/fallback contract). Emits the same per-fill
+    ///         `PositionEntered` / `MintMatched` events as the single path.
+    function mintMatchBatch(FillInputs[] calldata fs) external nonReentrant whenNotPaused onlyRelayer {
+        uint256 len = fs.length;
+        for (uint256 i; i < len; ++i) {
+            _mintMatch(fs[i]);
+        }
+    }
+
+    /// @dev Body of a single `mintMatch` fill, extracted verbatim (no guard modifiers — callers apply
+    ///      them once). Depends only on `f` and storage.
+    function _mintMatch(FillInputs calldata f) internal {
         Order calldata mo = f.makerOrder;
         Order calldata to = f.takerOrder;
 
@@ -652,6 +694,23 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///         Zero-fee: both parties receive cash, so there is no taker inflow to source a fee from;
     ///         `platformFee` / `makerFee` MUST be zero.
     function mergeMatch(FillInputs calldata f) external nonReentrant whenNotPaused onlyRelayer {
+        _mergeMatch(f);
+    }
+
+    /// @notice Batch-settle up to N `mergeMatch` fills in ONE transaction. The guard modifiers run
+    ///         ONCE for the whole batch; each fill settles independently via `_mergeMatch`.
+    ///         All-or-nothing (see `enterPositionBatch`). Emits the same per-fill `MergeMatched`
+    ///         events as the single path.
+    function mergeMatchBatch(FillInputs[] calldata fs) external nonReentrant whenNotPaused onlyRelayer {
+        uint256 len = fs.length;
+        for (uint256 i; i < len; ++i) {
+            _mergeMatch(fs[i]);
+        }
+    }
+
+    /// @dev Body of a single `mergeMatch` fill, extracted verbatim (no guard modifiers — callers
+    ///      apply them once). Depends only on `f` and storage.
+    function _mergeMatch(FillInputs calldata f) internal {
         Order calldata mo = f.makerOrder;
         Order calldata to = f.takerOrder;
 
