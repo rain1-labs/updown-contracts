@@ -261,23 +261,37 @@ contract DeployUpDown is Script {
         // `broadcast/` is gitignored and console output is not machine-readable,
         // so emit a JSON artifact the backend can consume and ops can audit
         // after the fact. Requires the `fs_permissions` entry in foundry.toml.
+        //
+        // Only written when WRITE_DEPLOYMENT_RECORD is set, which the `deploy:*`
+        // npm targets do and `simulate:*` deliberately does not. A dry run
+        // produces a file byte-identical to a real deploy's, so without this
+        // gate the deployments/ directory fills with records for deploys that
+        // never happened — indistinguishable from ones that did.
+        //
+        // NOTE on `block`: on Arbitrum, Solidity's block.number is the L1 block
+        // number, not the Arbitrum block. It is recorded for provenance but
+        // cannot be used to locate the deploy transaction on Arbiscan.
         string memory label = vm.envOr("DEPLOY_LABEL", string("unlabeled"));
-        string memory obj = "deployment";
-        vm.serializeString(obj, "label", label);
-        vm.serializeUint(obj, "chainId", block.chainid);
-        vm.serializeUint(obj, "block", block.number);
-        vm.serializeAddress(obj, "deployer", deployer);
-        vm.serializeAddress(obj, "settlement", address(settlement));
-        vm.serializeAddress(obj, "resolver", address(resolver));
-        vm.serializeAddress(obj, "autocycler", address(cycler));
-        vm.serializeAddress(obj, "relayer", relayer);
-        vm.serializeAddress(obj, "treasury", treasury);
-        vm.serializeAddress(obj, "keeperForwarder", keeperForwarder);
-        vm.serializeAddress(obj, "usdt", usdt);
-        vm.serializeAddress(obj, "verifierProxy", verifierProxy);
-        string memory record = vm.serializeAddress(obj, "pendingOwner", newOwner);
-        vm.writeJson(record, string.concat("deployments/", label, "-", vm.toString(block.number), ".json"));
-        console.log("Deployment record: deployments/%s-%s.json", label, vm.toString(block.number));
+        if (vm.envOr("WRITE_DEPLOYMENT_RECORD", false)) {
+            string memory obj = "deployment";
+            vm.serializeString(obj, "label", label);
+            vm.serializeUint(obj, "chainId", block.chainid);
+            vm.serializeUint(obj, "l1Block", block.number);
+            vm.serializeAddress(obj, "deployer", deployer);
+            vm.serializeAddress(obj, "settlement", address(settlement));
+            vm.serializeAddress(obj, "resolver", address(resolver));
+            vm.serializeAddress(obj, "autocycler", address(cycler));
+            vm.serializeAddress(obj, "relayer", relayer);
+            vm.serializeAddress(obj, "treasury", treasury);
+            vm.serializeAddress(obj, "keeperForwarder", keeperForwarder);
+            vm.serializeAddress(obj, "usdt", usdt);
+            vm.serializeAddress(obj, "verifierProxy", verifierProxy);
+            string memory record = vm.serializeAddress(obj, "pendingOwner", newOwner);
+            vm.writeJson(record, string.concat("deployments/", label, "-", vm.toString(block.number), ".json"));
+            console.log("Deployment record: deployments/%s-%s.json", label, vm.toString(block.number));
+        } else {
+            console.log("Deployment record: not written (simulation; set WRITE_DEPLOYMENT_RECORD=1 to write)");
+        }
 
         console.log("");
         if (newOwner != address(0) && newOwner != deployer) {
