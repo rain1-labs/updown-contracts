@@ -16,11 +16,7 @@ contract MockVerifierProxy is IVerifierProxy {
         return address(0);
     }
 
-    function verify(bytes calldata payload, bytes calldata)
-        external
-        payable
-        returns (bytes memory)
-    {
+    function verify(bytes calldata payload, bytes calldata) external payable returns (bytes memory) {
         (, bytes memory reportData) = abi.decode(payload, (bytes32[3], bytes));
         return reportData;
     }

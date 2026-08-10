@@ -55,14 +55,27 @@ contract RemediationV2Test is Test {
         mid = s.createMarket(PAIR, 3600, 50_000e8);
     }
 
-    function _order(Vm.Wallet memory w, uint256 mid, uint8 option, uint8 side, uint256 price, uint256 amount, uint256 maxFee, uint256 nonce)
-        internal
-        view
-        returns (UpDownSettlement.Order memory o)
-    {
+    function _order(
+        Vm.Wallet memory w,
+        uint256 mid,
+        uint8 option,
+        uint8 side,
+        uint256 price,
+        uint256 amount,
+        uint256 maxFee,
+        uint256 nonce
+    ) internal view returns (UpDownSettlement.Order memory o) {
         o = UpDownSettlement.Order({
-            maker: w.addr, market: mid, option: option, side: side, orderType: 0,
-            price: price, amount: amount, maxFee: maxFee, nonce: nonce, expiry: block.timestamp + 3600
+            maker: w.addr,
+            market: mid,
+            option: option,
+            side: side,
+            orderType: 0,
+            price: price,
+            amount: amount,
+            maxFee: maxFee,
+            nonce: nonce,
+            expiry: block.timestamp + 3600
         });
     }
 
@@ -76,7 +89,14 @@ contract RemediationV2Test is Test {
         view
         returns (UpDownSettlement.MintAuth memory a)
     {
-        a = UpDownSettlement.MintAuth({account: w.addr, market: mid, action: action, amount: amount, nonce: nonce, expiry: block.timestamp + 3600});
+        a = UpDownSettlement.MintAuth({
+            account: w.addr,
+            market: mid,
+            action: action,
+            amount: amount,
+            nonce: nonce,
+            expiry: block.timestamp + 3600
+        });
     }
 
     function _signAuth(Vm.Wallet memory w, UpDownSettlement.MintAuth memory a) internal returns (bytes memory) {
@@ -246,9 +266,13 @@ contract RemediationV2Test is Test {
         // Fill #2 against the SAME taker order: ANY extra fee now exceeds the cumulative cap → revert.
         UpDownSettlement.Order memory m2 = _order(carol, mid, UP, SELL, 6000, 20e18, 0, 202);
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
-            makerOrder: m2, makerSignature: _sign(carol, m2),
-            takerOrder: takerO, takerSignature: _sign(bob, takerO),
-            fillAmount: 20e18, platformFee: 1, makerFee: 0
+            makerOrder: m2,
+            makerSignature: _sign(carol, m2),
+            takerOrder: takerO,
+            takerSignature: _sign(bob, takerO),
+            fillAmount: 20e18,
+            platformFee: 1,
+            makerFee: 0
         });
         vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSelector(UpDownSettlement.FeeExceedsTakerCap.selector, 5e18 + 1, 5e18));
@@ -256,9 +280,13 @@ contract RemediationV2Test is Test {
 
         // A further zero-fee partial fill of the same order still works (within cap, nothing added).
         UpDownSettlement.FillInputs memory f0 = UpDownSettlement.FillInputs({
-            makerOrder: m2, makerSignature: _sign(carol, m2),
-            takerOrder: takerO, takerSignature: _sign(bob, takerO),
-            fillAmount: 20e18, platformFee: 0, makerFee: 0
+            makerOrder: m2,
+            makerSignature: _sign(carol, m2),
+            takerOrder: takerO,
+            takerSignature: _sign(bob, takerO),
+            fillAmount: 20e18,
+            platformFee: 0,
+            makerFee: 0
         });
         vm.prank(relayer);
         s.enterPosition(f0);
@@ -389,9 +417,13 @@ contract RemediationV2Test is Test {
         UpDownSettlement.Order memory m2 = _order(alice, mid, UP, SELL, 6000, 100e18, 0, 3);
         UpDownSettlement.Order memory t2 = _order(carol, mid, UP, BUY, 6000, 100e18, 0, 4);
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
-            makerOrder: m2, makerSignature: _sign(alice, m2),
-            takerOrder: t2, takerSignature: _sign(carol, t2),
-            fillAmount: 100e18, platformFee: 0, makerFee: 0
+            makerOrder: m2,
+            makerSignature: _sign(alice, m2),
+            takerOrder: t2,
+            takerSignature: _sign(carol, t2),
+            fillAmount: 100e18,
+            platformFee: 0,
+            makerFee: 0
         });
         vm.prank(relayer);
         vm.expectRevert(abi.encodeWithSelector(UpDownSettlement.InsufficientShares.selector, mid, UP, 100e18, 0));

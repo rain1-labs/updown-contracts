@@ -26,19 +26,22 @@ interface IUpDownSettlement {
 
     function resolve(uint256 marketId, int256 settlementPrice, uint8 winner) external;
 
-    function markets(uint256 marketId) external view returns (
-        bytes32 pairId,
-        uint128 cashUpFlow,
-        uint128 cashDownFlow,
-        uint64 startTime,
-        uint64 endTime,
-        uint32 duration,
-        uint8 winner,
-        bool resolved,
-        bool settled,
-        int128 strikePrice,
-        int128 settlementPrice
-    );
+    function markets(uint256 marketId)
+        external
+        view
+        returns (
+            bytes32 pairId,
+            uint128 cashUpFlow,
+            uint128 cashDownFlow,
+            uint64 startTime,
+            uint64 endTime,
+            uint32 duration,
+            uint8 winner,
+            bool resolved,
+            bool settled,
+            int128 strikePrice,
+            int128 settlementPrice
+        );
 
     function getMarket(uint256 marketId) external view returns (Market memory);
 }

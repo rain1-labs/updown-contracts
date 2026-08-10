@@ -186,9 +186,7 @@ contract MockDonE2ETest is Test {
         bytes memory bad = _wrapReport(FEED_BTC, T0 + 360, T0 + 360, BTC_STRIKE);
         vm.prank(relayer);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                ChainlinkResolver.ReportObservationOutOfWindow.selector, T0 + 300, T0 + 360
-            )
+            abi.encodeWithSelector(ChainlinkResolver.ReportObservationOutOfWindow.selector, T0 + 300, T0 + 360)
         );
         resolver.resolve(m5, bad);
 
@@ -209,9 +207,7 @@ contract MockDonE2ETest is Test {
         vm.warp(T0 + 300);
         bytes memory wrongFeed = _wrapReport(FEED_ETH, T0 + 300, T0 + 300, BTC_STRIKE);
         vm.prank(relayer);
-        vm.expectRevert(
-            abi.encodeWithSelector(ChainlinkResolver.ReportFeedIdMismatch.selector, FEED_BTC, FEED_ETH)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ChainlinkResolver.ReportFeedIdMismatch.selector, FEED_BTC, FEED_ETH));
         resolver.resolve(m5, wrongFeed);
     }
 }

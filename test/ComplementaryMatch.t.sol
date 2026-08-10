@@ -60,14 +60,27 @@ contract ComplementaryMatchTest is Test {
         mid = s.createMarket(PAIR, 3600, 50_000e8);
     }
 
-    function _order(Vm.Wallet memory w, uint256 mid, uint8 option, uint8 side, uint256 price, uint256 amount, uint256 maxFee, uint256 nonce)
-        internal
-        view
-        returns (UpDownSettlement.Order memory o)
-    {
+    function _order(
+        Vm.Wallet memory w,
+        uint256 mid,
+        uint8 option,
+        uint8 side,
+        uint256 price,
+        uint256 amount,
+        uint256 maxFee,
+        uint256 nonce
+    ) internal view returns (UpDownSettlement.Order memory o) {
         o = UpDownSettlement.Order({
-            maker: w.addr, market: mid, option: option, side: side, orderType: 0,
-            price: price, amount: amount, maxFee: maxFee, nonce: nonce, expiry: block.timestamp + 3600
+            maker: w.addr,
+            market: mid,
+            option: option,
+            side: side,
+            orderType: 0,
+            price: price,
+            amount: amount,
+            maxFee: maxFee,
+            nonce: nonce,
+            expiry: block.timestamp + 3600
         });
     }
 
@@ -244,9 +257,13 @@ contract ComplementaryMatchTest is Test {
         UpDownSettlement.Order memory upBuy = _order(alice, mid, UP, BUY, 6000, 100e18, 0, 1);
         UpDownSettlement.Order memory downBuy = _order(bob, mid, DOWN, BUY, 4000, 100e18, 0, 2);
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
-            makerOrder: upBuy, makerSignature: _sign(alice, upBuy),
-            takerOrder: downBuy, takerSignature: _sign(carol, downBuy), // wrong signer
-            fillAmount: 100e18, platformFee: 0, makerFee: 0
+            makerOrder: upBuy,
+            makerSignature: _sign(alice, upBuy),
+            takerOrder: downBuy,
+            takerSignature: _sign(carol, downBuy), // wrong signer
+            fillAmount: 100e18,
+            platformFee: 0,
+            makerFee: 0
         });
         vm.prank(relayer);
         vm.expectRevert(UpDownSettlement.InvalidSignature.selector);

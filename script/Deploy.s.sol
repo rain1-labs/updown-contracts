@@ -86,7 +86,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///                                     Arbitrum One:     0xFdB631F5EE196F0ed6FAa767959853A9F217697D
 ///                                     Arbitrum Sepolia: deploy `MockAggregatorV3(0, 0, 1)` (answer=0, ancient updatedAt).
 contract DeployUpDown is Script {
-
     // ── Pair IDs ────────────────────────────────────────────────────────
     bytes32 constant BTCUSD = keccak256("BTC/USD");
     bytes32 constant ETHUSD = keccak256("ETH/USD");

@@ -162,9 +162,14 @@ contract ShareHandler is Test {
     }
 
     // ── Transfer a share via a two-sided signed fill (F-2026-17756/17757). ──
-    function fuzzFill(uint256 marketIdx, uint256 sellerIdx, uint256 buyerIdx, uint8 option, uint16 priceBps, uint256 fillAmount)
-        external
-    {
+    function fuzzFill(
+        uint256 marketIdx,
+        uint256 sellerIdx,
+        uint256 buyerIdx,
+        uint8 option,
+        uint16 priceBps,
+        uint256 fillAmount
+    ) external {
         (uint256 mid, bool ok) = _activeMarket(marketIdx);
         if (!ok) return;
         Vm.Wallet memory seller = wallets[sellerIdx % wallets.length];
@@ -179,12 +184,28 @@ contract ShareHandler is Test {
         if (usdt.balanceOf(buyer.addr) < cashPart) return;
 
         UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
-            maker: seller.addr, market: mid, option: option, side: 1, orderType: 0,
-            price: priceBps, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+            maker: seller.addr,
+            market: mid,
+            option: option,
+            side: 1,
+            orderType: 0,
+            price: priceBps,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
         });
         UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
-            maker: buyer.addr, market: mid, option: option, side: 0, orderType: 0,
-            price: priceBps, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+            maker: buyer.addr,
+            market: mid,
+            option: option,
+            side: 0,
+            orderType: 0,
+            price: priceBps,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
         });
 
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
@@ -218,17 +239,37 @@ contract ShareHandler is Test {
         if (usdt.balanceOf(upBuyer.addr) < upCash || usdt.balanceOf(downBuyer.addr) < downCash) return;
 
         UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
-            maker: upBuyer.addr, market: mid, option: 1, side: 0, orderType: 0,
-            price: pUp, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+            maker: upBuyer.addr,
+            market: mid,
+            option: 1,
+            side: 0,
+            orderType: 0,
+            price: pUp,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
         });
         UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
-            maker: downBuyer.addr, market: mid, option: 2, side: 0, orderType: 0,
-            price: pDown, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+            maker: downBuyer.addr,
+            market: mid,
+            option: 2,
+            side: 0,
+            orderType: 0,
+            price: pDown,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
         });
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
-            makerOrder: makerOrder, makerSignature: _sign(upBuyer, makerOrder),
-            takerOrder: takerOrder, takerSignature: _sign(downBuyer, takerOrder),
-            fillAmount: fillAmount, platformFee: 0, makerFee: 0
+            makerOrder: makerOrder,
+            makerSignature: _sign(upBuyer, makerOrder),
+            takerOrder: takerOrder,
+            takerSignature: _sign(downBuyer, takerOrder),
+            fillAmount: fillAmount,
+            platformFee: 0,
+            makerFee: 0
         });
         vm.prank(relayer);
         s.mintMatch(f);
@@ -254,17 +295,37 @@ contract ShareHandler is Test {
         uint256 pDown = 10000 - pUp; // sum == 10000, the crossing boundary for a merge
 
         UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
-            maker: upSeller.addr, market: mid, option: 1, side: 1, orderType: 0,
-            price: pUp, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+            maker: upSeller.addr,
+            market: mid,
+            option: 1,
+            side: 1,
+            orderType: 0,
+            price: pUp,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
         });
         UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
-            maker: downSeller.addr, market: mid, option: 2, side: 1, orderType: 0,
-            price: pDown, amount: fillAmount, maxFee: 0, nonce: ++nonceCounter, expiry: block.timestamp + 3600
+            maker: downSeller.addr,
+            market: mid,
+            option: 2,
+            side: 1,
+            orderType: 0,
+            price: pDown,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
         });
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
-            makerOrder: makerOrder, makerSignature: _sign(upSeller, makerOrder),
-            takerOrder: takerOrder, takerSignature: _sign(downSeller, takerOrder),
-            fillAmount: fillAmount, platformFee: 0, makerFee: 0
+            makerOrder: makerOrder,
+            makerSignature: _sign(upSeller, makerOrder),
+            takerOrder: takerOrder,
+            takerSignature: _sign(downSeller, takerOrder),
+            fillAmount: fillAmount,
+            platformFee: 0,
+            makerFee: 0
         });
         vm.prank(relayer);
         s.mergeMatch(f);

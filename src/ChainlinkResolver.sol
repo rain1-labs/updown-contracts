@@ -111,7 +111,9 @@ contract ChainlinkResolver is Ownable2Step {
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
-    event MarketRegistered(uint256 indexed marketId, address indexed settlement, bytes32 indexed pairId, int256 strikePrice);
+    event MarketRegistered(
+        uint256 indexed marketId, address indexed settlement, bytes32 indexed pairId, int256 strikePrice
+    );
     event MarketResolved(uint256 indexed marketId, uint256 winningOption, int256 settlementPrice, int256 strikePrice);
     event AuthorizedCallerSet(address indexed caller, bool authorized);
     /// @notice Streams swap: emitted on `configureStreamsFeed`. Off-chain
@@ -127,10 +129,7 @@ contract ChainlinkResolver is Ownable2Step {
     ///         consumers audit the report-vs-slot-boundary lag (must be
     ///         within MAX_STRIKE_REPORT_LAG per the validator below).
     event StrikeCaptured(
-        bytes32 indexed pairId,
-        uint64 indexed startTime,
-        int256 strikePrice,
-        uint64 observationsTimestamp
+        bytes32 indexed pairId, uint64 indexed startTime, int256 strikePrice, uint64 observationsTimestamp
     );
     /// @notice Streams swap: emitted on `withdrawLink`. Owner clawback
     ///         + rotation audit trail.
@@ -346,9 +345,12 @@ contract ChainlinkResolver is Ownable2Step {
         if (priceFeeds[pairId] == address(0) && streamsFeedId[pairId] == bytes32(0)) revert FeedNotConfigured();
 
         IUpDownSettlement.Market memory sm = IUpDownSettlement(settlement).getMarket(marketId);
-        if (sm.startTime == 0 || sm.pairId != pairId || int256(sm.strikePrice) != strikePrice) revert MarketNotRegistered();
+        if (sm.startTime == 0 || sm.pairId != pairId || int256(sm.strikePrice) != strikePrice) {
+            revert MarketNotRegistered();
+        }
 
-        markets[marketId] = MarketInfo({settlement: settlement, pairId: pairId, strikePrice: strikePrice, resolved: false});
+        markets[marketId] =
+            MarketInfo({settlement: settlement, pairId: pairId, strikePrice: strikePrice, resolved: false});
         emit MarketRegistered(marketId, settlement, pairId, strikePrice);
     }
 
@@ -568,10 +570,7 @@ contract ChainlinkResolver is Ownable2Step {
     /// @dev Pay the LINK verification fee, returning the `parameterPayload`
     ///      to pass to `verifierProxy.verify`. Encapsulates the FeeManager
     ///      lookup + approve dance so the main `resolve` flow stays linear.
-    function _payVerificationFee(bytes memory signedReport)
-        internal
-        returns (bytes memory parameterPayload)
-    {
+    function _payVerificationFee(bytes memory signedReport) internal returns (bytes memory parameterPayload) {
         address feeManagerAddr = verifierProxy.s_feeManager();
         if (feeManagerAddr == address(0)) {
             // Testnet / subscription-billed deployment — no fee path.
@@ -592,7 +591,7 @@ contract ChainlinkResolver is Ownable2Step {
         // reference contract passes `reportData` (the inner bytes), but
         // matching the docs' tutorial flow exactly.
         (, bytes memory reportData) = abi.decode(signedReport, (bytes32[3], bytes));
-        (FeeManagerAsset memory fee, , ) = feeManager.getFeeAndReward(address(this), reportData, feeToken);
+        (FeeManagerAsset memory fee,,) = feeManager.getFeeAndReward(address(this), reportData, feeToken);
 
         if (fee.amount > 0) {
             address rewardManager = feeManager.i_rewardManager();

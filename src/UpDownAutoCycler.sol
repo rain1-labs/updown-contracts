@@ -143,7 +143,7 @@ contract UpDownAutoCycler is Ownable2Step {
     struct CreateSlot {
         bytes32 pairId;
         uint256 tfIdx;
-        uint64 plannedStart;  // pre-computed by checkUpkeep so the coordinator knows the exact slot boundary to fetch a report for
+        uint64 plannedStart; // pre-computed by checkUpkeep so the coordinator knows the exact slot boundary to fetch a report for
         bytes signedReport;
     }
 
@@ -248,11 +248,7 @@ contract UpDownAutoCycler is Ownable2Step {
     }
 
     /// @notice Same layout as the default getter for a public array of structs.
-    function activeMarkets(uint256 index)
-        external
-        view
-        returns (uint256 marketId, uint256 endTime, bytes32 pairId)
-    {
+    function activeMarkets(uint256 index) external view returns (uint256 marketId, uint256 endTime, bytes32 pairId) {
         ActiveMarket storage m = _activeMarkets[index];
         return (m.marketId, m.endTime, m.pairId);
     }
@@ -333,9 +329,8 @@ contract UpDownAutoCycler is Ownable2Step {
                         // `signedReport` is empty here — coordinator fills it in
                         // before calling performUpkeep.
                         uint256 lastStart = pairTfLastCreated[pid][ti];
-                        uint256 plannedStart = lastStart == 0
-                            ? (block.timestamp / tft.duration) * tft.duration
-                            : lastStart + tft.duration;
+                        uint256 plannedStart =
+                            lastStart == 0 ? (block.timestamp / tft.duration) * tft.duration : lastStart + tft.duration;
                         createSlots[ci++] = CreateSlot({
                             pairId: pid,
                             tfIdx: ti,
@@ -374,8 +369,7 @@ contract UpDownAutoCycler is Ownable2Step {
         // `resolveIndices` is decoded for ABI/payload stability with the
         // Chainlink Automation registration but not iterated here because
         // resolution is roundId-bound and lives off-chain.
-        (, CreateSlot[] memory createSlots) =
-            abi.decode(performData, (uint256[], CreateSlot[]));
+        (, CreateSlot[] memory createSlots) = abi.decode(performData, (uint256[], CreateSlot[]));
 
         // Phase B: create new markets (external self-call so try/catch can recover)
         for (uint256 i; i < createSlots.length; ++i) {
@@ -395,9 +389,8 @@ contract UpDownAutoCycler is Ownable2Step {
                 if (permanentSkip && slot.tfIdx < NUM_TIMEFRAMES) {
                     TimeframeConfig storage tft = timeframes[slot.tfIdx];
                     uint256 lastStart = pairTfLastCreated[slot.pairId][slot.tfIdx];
-                    uint256 skippedSlotStart = lastStart == 0
-                        ? (block.timestamp / tft.duration) * tft.duration
-                        : lastStart + tft.duration;
+                    uint256 skippedSlotStart =
+                        lastStart == 0 ? (block.timestamp / tft.duration) * tft.duration : lastStart + tft.duration;
                     pairTfLastCreated[slot.pairId][slot.tfIdx] = skippedSlotStart;
                     emit SlotSkippedAfterFailure(slot.pairId, slot.tfIdx, skippedSlotStart);
                 }
@@ -443,9 +436,7 @@ contract UpDownAutoCycler is Ownable2Step {
     ///      from the backend's perspective). The off-chain matching engine
     ///      refuses to match orders on a market whose `startTime` is in
     ///      the future, so trades only land at-or-after the boundary.
-    function _createMarket(uint256 tfIdx, bytes32 pairId, uint64 plannedStartArg, bytes memory signedReport)
-        internal
-    {
+    function _createMarket(uint256 tfIdx, bytes32 pairId, uint64 plannedStartArg, bytes memory signedReport) internal {
         if (tfIdx >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
         if (!supportedPairs[pairId]) revert("pair not supported");
 

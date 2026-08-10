@@ -137,9 +137,8 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         uint256 expiry;
     }
 
-    bytes32 public constant MINT_AUTH_TYPEHASH = keccak256(
-        "MintAuth(address account,uint256 market,uint8 action,uint256 amount,uint256 nonce,uint256 expiry)"
-    );
+    bytes32 public constant MINT_AUTH_TYPEHASH =
+        keccak256("MintAuth(address account,uint256 market,uint8 action,uint256 amount,uint256 nonce,uint256 expiry)");
 
     uint8 internal constant OPTION_UP = 1;
     uint8 internal constant OPTION_DOWN = 2;
@@ -315,10 +314,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     /// @notice F-2026-17746: the `_platformFeeBps`/`_makerFeeBps` constructor params were removed
     ///         (the on-chain bps were never enforced and only misled monitoring; fees are now signed
     ///         and capped per order). Deploy scripts updated in lock-step.
-    constructor(IERC20 _usdt, address initialOwner)
-        Ownable(initialOwner)
-        EIP712("UpDown Exchange", "1")
-    {
+    constructor(IERC20 _usdt, address initialOwner) Ownable(initialOwner) EIP712("UpDown Exchange", "1") {
         if (address(_usdt) == address(0)) revert ZeroAddress();
         usdt = _usdt;
     }
@@ -396,9 +392,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     }
 
     function hashMintAuth(MintAuth memory a) public pure returns (bytes32) {
-        return keccak256(
-            abi.encode(MINT_AUTH_TYPEHASH, a.account, a.market, a.action, a.amount, a.nonce, a.expiry)
-        );
+        return keccak256(abi.encode(MINT_AUTH_TYPEHASH, a.account, a.market, a.action, a.amount, a.nonce, a.expiry));
     }
 
     // ── Fill settlement (F-2026-17756 / 17757 / 17731 / 17739) ──────────
@@ -685,7 +679,9 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
 
         emit PositionEntered(mo.market, OPTION_UP, f.fillAmount, upBuyer);
         emit PositionEntered(mo.market, OPTION_DOWN, f.fillAmount, downBuyer);
-        emit MintMatched(mo.market, upBuyer, downBuyer, f.fillAmount, upCash, downCash, to.maker, f.platformFee, f.makerFee);
+        emit MintMatched(
+            mo.market, upBuyer, downBuyer, f.fillAmount, upCash, downCash, to.maker, f.platformFee, f.makerFee
+        );
     }
 
     /// @notice Settle a MERGE match between two signed SELL orders on opposite options. `f.makerOrder`
@@ -791,12 +787,13 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     // is the account) so a user can always exit a complete set even if the relayer is gone.
 
     /// @notice Relayer-submitted complementary mint with the minter's signed consent (F-2026-17772).
-    function complementaryMint(uint256 marketId, uint256 amount, address minter, MintAuth calldata auth, bytes calldata sig)
-        external
-        nonReentrant
-        whenNotPaused
-        onlyRelayer
-    {
+    function complementaryMint(
+        uint256 marketId,
+        uint256 amount,
+        address minter,
+        MintAuth calldata auth,
+        bytes calldata sig
+    ) external nonReentrant whenNotPaused onlyRelayer {
         _checkMintAuth(auth, sig, minter, marketId, MINT_ACTION_MINT, amount);
         _mint(marketId, amount, minter);
     }
@@ -826,12 +823,13 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     }
 
     /// @notice Relayer-submitted complementary burn with the holder's signed consent (F-2026-17772).
-    function complementaryBurn(uint256 marketId, uint256 amount, address holder, MintAuth calldata auth, bytes calldata sig)
-        external
-        nonReentrant
-        whenNotPaused
-        onlyRelayer
-    {
+    function complementaryBurn(
+        uint256 marketId,
+        uint256 amount,
+        address holder,
+        MintAuth calldata auth,
+        bytes calldata sig
+    ) external nonReentrant whenNotPaused onlyRelayer {
         _checkMintAuth(auth, sig, holder, marketId, MINT_ACTION_BURN, amount);
         _burn(marketId, amount, holder);
     }
@@ -876,10 +874,9 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         uint8 action,
         uint256 amount
     ) internal {
-        if (
-            auth.account != account || auth.market != marketId || auth.action != action
-                || auth.amount != amount
-        ) revert InvalidMintAuth();
+        if (auth.account != account || auth.market != marketId || auth.action != action || auth.amount != amount) {
+            revert InvalidMintAuth();
+        }
         if (block.timestamp > auth.expiry) revert InvalidMintAuth();
         if (mintAuthNonceUsed[account][auth.nonce]) revert MintAuthNonceUsed(account, auth.nonce);
         if (!SignatureChecker.isValidSignatureNow(account, _hashTypedDataV4(hashMintAuth(auth)), sig)) {
@@ -973,9 +970,8 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
             rebateWindowStart = block.timestamp;
             rebateClaimedInWindow = 0;
         }
-        uint256 remaining = rebateBudgetPerWindow > rebateClaimedInWindow
-            ? rebateBudgetPerWindow - rebateClaimedInWindow
-            : 0;
+        uint256 remaining =
+            rebateBudgetPerWindow > rebateClaimedInWindow ? rebateBudgetPerWindow - rebateClaimedInWindow : 0;
 
         // F-2026-17975: claim PARTIALLY up to the remaining window budget instead of an
         // all-or-nothing revert. Previously, any accumulator larger than `rebateBudgetPerWindow`

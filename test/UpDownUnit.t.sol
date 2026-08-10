@@ -187,11 +187,7 @@ contract MockVerifierProxy is IVerifierProxy {
         nextReport = r;
     }
 
-    function verify(bytes calldata, bytes calldata)
-        external
-        payable
-        returns (bytes memory verifierResponse)
-    {
+    function verify(bytes calldata, bytes calldata) external payable returns (bytes memory verifierResponse) {
         verifierResponse = abi.encode(nextReport);
     }
 }
@@ -304,8 +300,17 @@ contract UpDownUnit is Test {
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
         settlement = new UpDownSettlement(usdt, owner);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(settlement),
+            address(verifierProxy),
+            address(link)
+        );
         settlement.setResolver(address(r));
         cycler = new UpDownAutoCyclerHarness(owner, address(r), address(settlement));
         settlement.setAutocycler(address(cycler));
@@ -362,12 +367,7 @@ contract UpDownUnit is Test {
     ///      plannedStart for `(pairId, tfIdx)`, then immediately
     ///      `harnessCreateMarket`. Used to keep each test's
     ///      Streams-strike plumbing to one line.
-    function _stageAndCreate(
-        UpDownAutoCyclerHarness cycler,
-        bytes32 pairId,
-        uint256 tfIdx,
-        int192 price
-    ) internal {
+    function _stageAndCreate(UpDownAutoCyclerHarness cycler, bytes32 pairId, uint256 tfIdx, int192 price) internal {
         uint256 plannedStart = _nextPlannedStart(cycler, pairId, tfIdx);
         _stageStrikeReport(price, plannedStart);
         cycler.harnessCreateMarket(tfIdx, pairId);
@@ -377,15 +377,23 @@ contract UpDownUnit is Test {
         return keccak256(abi.encodePacked("BTC/USD-streams-test-feed-id"));
     }
 
-
     function test_performUpkeepPrunesResolved() public {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
         UpDownSettlement settlement = new UpDownSettlement(usdt, owner);
 
-        ChainlinkResolver resolver =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement), address(verifierProxy), address(link));
+        ChainlinkResolver resolver = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(settlement),
+            address(verifierProxy),
+            address(link)
+        );
         settlement.setResolver(address(resolver));
 
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(resolver), address(settlement));
@@ -417,8 +425,17 @@ contract UpDownUnit is Test {
 
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
-        ChainlinkResolver resolver =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
+        ChainlinkResolver resolver = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(bad),
+            address(verifierProxy),
+            address(link)
+        );
 
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(resolver), address(bad));
         resolver.setAuthorizedCaller(address(cycler), true);
@@ -703,8 +720,7 @@ contract UpDownUnit is Test {
 
         uint256 ls = cycler.pairTfLastCreated(BTCUSD, 0);
         assertEq(ls, (block.timestamp / 300) * 300, "bootstrap aligned to current 5m boundary");
-        assertGt(ls + 300, block.timestamp - cycler.RESOLVER_MAX_STALENESS(),
-            "bootstrap end is fresh by definition");
+        assertGt(ls + 300, block.timestamp - cycler.RESOLVER_MAX_STALENESS(), "bootstrap end is fresh by definition");
     }
 
     // ── F-04 immutable resolver/settlement tests (deep review 2026-05-11) ─
@@ -730,8 +746,17 @@ contract UpDownUnit is Test {
         // settlement arg specifically.
         ERC20Mock usdt = new ERC20Mock();
         UpDownSettlement st = new UpDownSettlement(usdt, owner);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(st),
+            address(verifierProxy),
+            address(link)
+        );
         vm.expectRevert(UpDownAutoCycler.ZeroAddress.selector);
         new UpDownAutoCyclerHarness(owner, address(r), address(0));
     }
@@ -763,8 +788,17 @@ contract UpDownUnit is Test {
         MockBtcFeed feed = new MockBtcFeed(oversized);
         ERC20Mock usdt = new ERC20Mock();
         UpDownSettlement st = new UpDownSettlement(usdt, owner);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(st),
+            address(verifierProxy),
+            address(link)
+        );
         st.setResolver(address(r));
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(st));
         st.setAutocycler(address(cycler));
@@ -789,8 +823,17 @@ contract UpDownUnit is Test {
         MockBtcFeed feed = new MockBtcFeed(boundary);
         ERC20Mock usdt = new ERC20Mock();
         UpDownSettlement st = new UpDownSettlement(usdt, owner);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(st),
+            address(verifierProxy),
+            address(link)
+        );
         st.setResolver(address(r));
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(st));
         st.setAutocycler(address(cycler));
@@ -815,8 +858,17 @@ contract UpDownUnit is Test {
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
         UpDownSettlement settlement = new UpDownSettlement(usdt, owner);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(settlement),
+            address(verifierProxy),
+            address(link)
+        );
         settlement.setResolver(address(r));
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(settlement));
         settlement.setAutocycler(address(cycler));
@@ -829,7 +881,12 @@ contract UpDownUnit is Test {
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
         // plannedStart = expected next slot so the idempotency check passes and we reach captureStrike.
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: uint64(lastStart + 300), signedReport: bytes("")});
+        slots[0] = UpDownAutoCycler.CreateSlot({
+            pairId: BTCUSD,
+            tfIdx: 0,
+            plannedStart: uint64(lastStart + 300),
+            signedReport: bytes("")
+        });
         cycler.performUpkeep(abi.encode(empty, slots));
 
         // Pointer is UNCHANGED — the transient failure does not advance it.
@@ -843,8 +900,17 @@ contract UpDownUnit is Test {
         RevertingSettlement bad = new RevertingSettlement();
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(bad),
+            address(verifierProxy),
+            address(link)
+        );
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
         r.setAuthorizedCaller(address(cycler), true);
 
@@ -856,7 +922,12 @@ contract UpDownUnit is Test {
 
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: uint64(lastStart + 300), signedReport: bytes("")});
+        slots[0] = UpDownAutoCycler.CreateSlot({
+            pairId: BTCUSD,
+            tfIdx: 0,
+            plannedStart: uint64(lastStart + 300),
+            signedReport: bytes("")
+        });
 
         vm.expectEmit(true, true, false, true);
         emit UpDownAutoCycler.SlotSkippedAfterFailure(BTCUSD, 0, lastStart + 300);
@@ -871,8 +942,17 @@ contract UpDownUnit is Test {
         RevertingSettlement bad = new RevertingSettlement();
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
-        ChainlinkResolver r =
-            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(bad), address(verifierProxy), address(link));
+        ChainlinkResolver r = new ChainlinkResolver(
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(bad),
+            address(verifierProxy),
+            address(link)
+        );
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(bad));
         r.setAuthorizedCaller(address(cycler), true);
 
@@ -883,7 +963,12 @@ contract UpDownUnit is Test {
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
         // Stale plannedStart (the already-created slot, not the expected next one).
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: uint64(lastStart), signedReport: bytes("")});
+        slots[0] = UpDownAutoCycler.CreateSlot({
+            pairId: BTCUSD,
+            tfIdx: 0,
+            plannedStart: uint64(lastStart),
+            signedReport: bytes("")
+        });
 
         vm.expectEmit(true, true, false, true);
         emit UpDownAutoCycler.SlotAlreadyProcessed(BTCUSD, 0, lastStart);
@@ -1012,8 +1097,8 @@ contract UpDownUnit is Test {
         assertEq(cycler.activeMarketCount(), 2, "post: 2 active");
 
         // Verify mid=11 is gone, mid=10 still there.
-        (uint256 m0,, ) = cycler.activeMarkets(0);
-        (uint256 m1,, ) = cycler.activeMarkets(1);
+        (uint256 m0,,) = cycler.activeMarkets(0);
+        (uint256 m1,,) = cycler.activeMarkets(1);
         assertTrue(m0 != 11 && m1 != 11, "mid=11 must be evicted");
     }
 
@@ -1036,7 +1121,7 @@ contract UpDownUnit is Test {
 
         // Only mid=21 should remain.
         assertEq(cycler.activeMarketCount(), 1, "1 remaining after batch evict");
-        (uint256 remaining,, ) = cycler.activeMarkets(0);
+        (uint256 remaining,,) = cycler.activeMarkets(0);
         assertEq(remaining, 21, "mid=21 is the only un-evicted one");
     }
 
@@ -1054,12 +1139,11 @@ contract UpDownUnit is Test {
         uint256[] memory toEvict = new uint256[](1);
         toEvict[0] = 30;
 
-        vm.expectRevert(abi.encodeWithSelector(
-            UpDownAutoCycler.MarketStillResolvable.selector,
-            uint256(30),
-            freshEnd,
-            block.timestamp
-        ));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                UpDownAutoCycler.MarketStillResolvable.selector, uint256(30), freshEnd, block.timestamp
+            )
+        );
         cycler.evictUnresolved(toEvict);
 
         // Nothing was evicted on the revert.
@@ -1078,10 +1162,7 @@ contract UpDownUnit is Test {
         uint256[] memory toEvict = new uint256[](1);
         toEvict[0] = 999; // never created
 
-        vm.expectRevert(abi.encodeWithSelector(
-            UpDownAutoCycler.MarketNotInActiveSet.selector,
-            uint256(999)
-        ));
+        vm.expectRevert(abi.encodeWithSelector(UpDownAutoCycler.MarketNotInActiveSet.selector, uint256(999)));
         cycler.evictUnresolved(toEvict);
 
         assertEq(cycler.activeMarketCount(), 1, "real market untouched");
@@ -1265,10 +1346,7 @@ contract UpDownUnit is Test {
     // `abi.decode(payload, (bytes32[3], bytes))` happening in
     // `_payVerificationFee`, so the fee path exercises end-to-end.
 
-    function _deployStreamsResolverSystem()
-        internal
-        returns (ChainlinkResolver r, UpDownSettlement st)
-    {
+    function _deployStreamsResolverSystem() internal returns (ChainlinkResolver r, UpDownSettlement st) {
         MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
         MockBtcFeed feed = new MockBtcFeed(50_000e8);
         ERC20Mock usdt = new ERC20Mock();
@@ -1319,10 +1397,7 @@ contract UpDownUnit is Test {
         r.ask = r.price;
     }
 
-    function _createAndExpireMarket(UpDownSettlement st)
-        internal
-        returns (uint256 mid, uint256 endTs)
-    {
+    function _createAndExpireMarket(UpDownSettlement st) internal returns (uint256 mid, uint256 endTs) {
         uint256 startedAt = block.timestamp;
         mid = st.createMarket(BTCUSD, 300, 50_000e8); // endTime = startedAt + 300
         endTs = startedAt + 300;
@@ -1339,11 +1414,7 @@ contract UpDownUnit is Test {
 
         (,,, bool resolved) = r.markets(mid);
         assertTrue(resolved, "happy-path resolve marks the resolver entry as resolved");
-        assertEq(
-            int256(st.getMarket(mid).settlementPrice),
-            60_000e8,
-            "settlement price comes from report.price"
-        );
+        assertEq(int256(st.getMarket(mid).settlementPrice), 60_000e8, "settlement price comes from report.price");
         assertEq(st.getMarket(mid).winner, 1, "60k > 50k strike means UP wins");
     }
 
@@ -1358,9 +1429,7 @@ contract UpDownUnit is Test {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                ChainlinkResolver.ReportFeedIdMismatch.selector,
-                bytes32(uint256(0xBEEFBEEFBEEFBEEF)),
-                wrongFeed
+                ChainlinkResolver.ReportFeedIdMismatch.selector, bytes32(uint256(0xBEEFBEEFBEEFBEEF)), wrongFeed
             )
         );
         r.resolve(mid, _fakeSignedReport());
@@ -1376,9 +1445,7 @@ contract UpDownUnit is Test {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                ChainlinkResolver.ReportExpired.selector,
-                uint256(block.timestamp - 1),
-                block.timestamp
+                ChainlinkResolver.ReportExpired.selector, uint256(block.timestamp - 1), block.timestamp
             )
         );
         r.resolve(mid, _fakeSignedReport());
@@ -1395,11 +1462,7 @@ contract UpDownUnit is Test {
         verifierProxy.setNextReport(rep);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                ChainlinkResolver.ReportObservationOutOfWindow.selector,
-                endTs,
-                uint256(endTs + 1)
-            )
+            abi.encodeWithSelector(ChainlinkResolver.ReportObservationOutOfWindow.selector, endTs, uint256(endTs + 1))
         );
         r.resolve(mid, _fakeSignedReport());
     }
@@ -1414,11 +1477,7 @@ contract UpDownUnit is Test {
         verifierProxy.setNextReport(rep);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                ChainlinkResolver.ReportObservationOutOfWindow.selector,
-                endTs,
-                uint256(endTs - 31)
-            )
+            abi.encodeWithSelector(ChainlinkResolver.ReportObservationOutOfWindow.selector, endTs, uint256(endTs - 31))
         );
         r.resolve(mid, _fakeSignedReport());
     }
@@ -1595,7 +1654,7 @@ contract UpDownUnit is Test {
     }
 
     function test_streams_resolve_revertsWhenMarketNotRegistered() public {
-        (ChainlinkResolver r, ) = _deployStreamsResolverSystem();
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
         // Never call registerMarket for marketId=999.
         verifierProxy.setNextReport(_baseReport(block.timestamp));
         vm.expectRevert(ChainlinkResolver.MarketNotRegistered.selector);
@@ -1625,7 +1684,7 @@ contract UpDownUnit is Test {
     }
 
     function test_streams_withdrawLink_ownerOnly() public {
-        (ChainlinkResolver r, ) = _deployStreamsResolverSystem();
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
         uint256 amount = 10e18;
 
         vm.prank(makeAddr("notOwner"));
@@ -1644,8 +1703,7 @@ contract UpDownUnit is Test {
         UpDownSettlement st = new UpDownSettlement(usdt, owner);
         vm.expectRevert(ChainlinkResolver.ZeroAddress.selector);
         new ChainlinkResolver(
-            owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0),
-            address(st), address(0), address(link)
+            owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(st), address(0), address(link)
         );
     }
 
@@ -1656,8 +1714,15 @@ contract UpDownUnit is Test {
         UpDownSettlement st = new UpDownSettlement(usdt, owner);
         vm.expectRevert(ChainlinkResolver.ZeroAddress.selector);
         new ChainlinkResolver(
-            owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0),
-            address(st), address(verifierProxy), address(0)
+            owner,
+            address(seq),
+            BTCUSD,
+            address(feed),
+            bytes32(0),
+            address(0),
+            address(st),
+            address(verifierProxy),
+            address(0)
         );
     }
 }
