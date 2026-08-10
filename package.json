@@ -22,9 +22,6 @@
     "accept-ownership:dev": "set -a && . ./.env.dev && set +a && for c in \"$SETTLEMENT_ADDRESS\" \"$RESOLVER_ADDRESS\" \"$CYCLER_ADDRESS\"; do cast send \"$c\" 'acceptOwnership()' --rpc-url \"$ARBITRUM_RPC_URL\" --private-key \"$OWNER_PRIVATE_KEY\"; done",
     "accept-ownership:prod": "set -a && . ./.env.prod && set +a && echo 'Prod owner should be a Safe — submit acceptOwnership() to these three from the Safe UI:' && echo \"  $SETTLEMENT_ADDRESS\" && echo \"  $RESOLVER_ADDRESS\" && echo \"  $CYCLER_ADDRESS\"",
 
-    "usdt:mint": "set -a && . ./.env.dev && set +a && cast send \"$USDT_ADDRESS\" 'mint(address,uint256)' \"$MINT_RECIPIENT\" \"${MINT_AMOUNT:-5000000000}\" --rpc-url \"$ARBITRUM_RPC_URL\" --private-key \"$MINTER_PRIVATE_KEY\"",
-    "usdt:send": "set -a && . ./.env.dev && set +a && cast send \"$USDT_ADDRESS\" 'transfer(address,uint256)' \"$MINT_RECIPIENT\" \"${MINT_AMOUNT:-5000000000}\" --rpc-url \"$ARBITRUM_RPC_URL\" --private-key \"$MINTER_PRIVATE_KEY\"",
-
     "streams:set-dev": "set -a && . ./.env.dev && set +a && cast send \"$RESOLVER_ADDRESS\" 'configureStreamsFeed(bytes32,bytes32)' \"$(cast keccak 'BTC/USD')\" \"$STREAMS_FEED_ID_BTC_USD\" --rpc-url \"$ARBITRUM_RPC_URL\" --private-key \"$OWNER_PRIVATE_KEY\" && cast send \"$RESOLVER_ADDRESS\" 'configureStreamsFeed(bytes32,bytes32)' \"$(cast keccak 'ETH/USD')\" \"$STREAMS_FEED_ID_ETH_USD\" --rpc-url \"$ARBITRUM_RPC_URL\" --private-key \"$OWNER_PRIVATE_KEY\"",
 
     "fork:test": "FOUNDRY_PROFILE=fork forge test --match-contract UpDownForkTest -vvv"

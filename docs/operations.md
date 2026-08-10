@@ -81,6 +81,33 @@ npm run deploy:prod      # prompts for confirmation
 
 Each deploy writes a JSON record to `deployments/<label>-<block>.json`.
 
+## Funding dev wallets (dev-USDT)
+
+Manual, by design — not an npm target, so the mint authority key is never sourced into a
+deploy shell.
+
+The dev collateral token `0xCa4f77A38d8552Dd1D5E44e890173921B67725F4` ("USDT Mock", USDTm,
+6 decimals) is **not** the repo's `MockUSDT` and its `mint()` is **owner-gated**, not
+permissionless — calling it from any other key reverts `OwnableUnauthorizedAccount`. The mint
+authority is `0xAff5289591653038340645FDc1e1Ed3a3B52E436`.
+
+That wallet already holds ~10^13 USDTm, so a plain transfer is normally enough and no minting
+is needed:
+
+```bash
+# 5,000 USDTm (6 decimals) to a test wallet
+cast send 0xCa4f77A38d8552Dd1D5E44e890173921B67725F4 \
+  "transfer(address,uint256)" <RECIPIENT> 5000000000 \
+  --rpc-url $ARBITRUM_RPC_URL --account <minter-keystore-account>
+```
+
+Swap `transfer` for `mint(address,uint256)` if the balance is ever exhausted. Prefer a Foundry
+keystore (`cast wallet import <name> --interactive`) over `--private-key` so the key stays out
+of shell history.
+
+Users must also approve the Settlement before trading — collateral is pulled from the user at
+fill time, there is no deposit-to-relayer step.
+
 ## Environments
 
 **Both dev and prod are on Arbitrum One (chainId 42161).** Dev is not a testnet — it uses a
