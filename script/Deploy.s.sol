@@ -19,8 +19,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// path, Settlement deploy is SKIPPED, and after Resolver + AutoCycler
 /// are deployed the script calls `settlement.setResolver(newResolver)` +
 /// `settlement.setAutocycler(newCycler)` from the deployer (owner) to
-/// rewire the existing Settlement's pointers. All historic markets +
-/// ThinWallet allowances against the existing Settlement stay intact.
+/// rewire the existing Settlement's pointers. All historic markets, user
+/// shares, and USDT allowances against the existing Settlement stay intact.
 ///
 /// Required env vars:
 ///   DEPLOYER_PRIVATE_KEY            — the deployer/owner key
@@ -135,7 +135,7 @@ contract DeployUpDown is Script {
         address newOwner = vm.envOr("OWNER_ADDRESS", address(0));
 
         // Migration mode: EXISTING_SETTLEMENT_ADDRESS preserves historic
-        // markets + ThinWallet allowances. New deploy when unset.
+        // markets, user shares, and USDT allowances. New deploy when unset.
         address existingSettlement;
         try vm.envAddress("EXISTING_SETTLEMENT_ADDRESS") returns (address a) {
             existingSettlement = a;
