@@ -57,12 +57,15 @@ jobs:
       - name: Test
         run: forge test -vv
 
-      # Non-blocking on purpose. Two mocks are not fmt-clean, and one of them
-      # (MockVerifierProxy) is DEPLOYED on the dev environment at
-      # 0x9c8BA5dE25aB2fd183704c354Edf118fa3dA81b4 with bytecode byte-identical
-      # to this tree. Reformatting changes the source metadata hash, which would
-      # break that match and any future Arbiscan verification of it. Report the
-      # drift, don't enforce it.
+      # Non-blocking on purpose: fmt drift is a style signal, not a build break.
+      #
+      # Note on MockVerifierProxy, deployed on dev at
+      # 0x9c8BA5dE25aB2fd183704c354Edf118fa3dA81b4: as of the 9a7b3d8 formatting
+      # pass, its executable bytecode still matches this tree exactly but the
+      # source metadata hash no longer does, so the deployed instance is not
+      # Arbiscan-verifiable from current source. Harmless (stateless, ownerless,
+      # dev-only, holds nothing) — and `npm run mockdon:dev` redeploys a matching
+      # one during the next dev deploy if you want the match back.
       - name: Format check (informational)
         continue-on-error: true
         run: forge fmt --check
