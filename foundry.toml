@@ -6,6 +6,9 @@ solc = "0.8.29"
 via_ir = true
 optimizer = true
 optimizer_runs = 200
+# Deploy.s.sol writes a JSON deployment record here (vm.writeJson). Scoped to
+# this one directory so scripts cannot touch anything else on disk.
+fs_permissions = [{ access = "write", path = "./deployments" }]
 
 [profile.default.fmt]
 line_length = 120
@@ -20,4 +23,10 @@ ffi = true
 
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"
-arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
+
+# Arbiscan verification. `hardhat.config.js` used to hold this key; that file is
+# gone, so without this section `forge script --verify` fails after the contracts
+# are already broadcast. Both dev and prod are chain 42161, so one entry serves
+# both. The key is read from the environment — never inline it here.
+[etherscan]
+arbitrum = { key = "${ARBISCAN_API_KEY}", chain = 42161 }

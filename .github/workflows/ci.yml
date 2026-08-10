@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    # '**' = every branch, at any depth — dev, feature/x, release/1.2,
+    # audit/whatever. Listing branches at all is what scopes this; omitting the
+    # key entirely would also fire on every tag push, which we don't want.
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same branch/PR instead of queueing them.
+# Pushing three times in a minute then leaves one run, not three.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  test:
+    name: build + test
+    # Now that `push` covers every branch, a same-repo PR would otherwise run
+    # twice per commit — once for the push, once for the pull_request. Run the
+    # pull_request event ONLY for PRs opened from a fork, whose commits never
+    # produce a push event here. Full coverage, no duplicate runs.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # forge-std and openzeppelin-contracts are git submodules, not npm
+          # packages. Without this the build fails on missing remappings.
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Show versions
+        run: forge --version
+
+      - name: Build
+        run: forge build
+
+      # UpDownSettlement is the contract to watch: 16,968 B runtime, 7,608 B of
+      # headroom under the 24,576 B EIP-170 limit. viaIR + a few more features
+      # could close that gap, and the failure mode is a deploy that reverts at
+      # the very end of a rotation. Fail the build before that happens.
+      - name: Contract sizes (EIP-170 headroom)
+        run: forge build --sizes
+
+      - name: Test
+        run: forge test -vv
+
+      # Non-blocking on purpose. Two mocks are not fmt-clean, and one of them
+      # (MockVerifierProxy) is DEPLOYED on the dev environment at
+      # 0x9c8BA5dE25aB2fd183704c354Edf118fa3dA81b4 with bytecode byte-identical
+      # to this tree. Reformatting changes the source metadata hash, which would
+      # break that match and any future Arbiscan verification of it. Report the
+      # drift, don't enforce it.
+      - name: Format check (informational)
+        continue-on-error: true
+        run: forge fmt --check
+
+  fork-test:
+    name: fork tests (real DON)
+    # Deliberately NOT widened to every branch along with the `test` job. Two
+    # reasons: the `fork` profile enables ffi (foundry.toml keeps it out of the
+    # default profile so the audited suite never runs with it), and each run
+    # spends real Alchemy quota against the live DON. Main merges and manual
+    # dispatch only — use `workflow_dispatch` to run it against a branch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # Every fork test self-skips when ARB_FORK_RPC is unset, so this is a
+      # no-op until the secret is configured — it never fails the build for a
+      # missing secret. Add repo secrets ARB_FORK_RPC (and optionally
+      # ALCHEMY_API_KEY) to turn on real coverage.
+      - name: Fork tests
+        env:
+          ARB_FORK_RPC: ${{ secrets.ARB_FORK_RPC }}
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+        run: FOUNDRY_PROFILE=fork forge test --match-contract "ForkTest" -vv
