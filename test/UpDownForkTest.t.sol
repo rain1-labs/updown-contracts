@@ -5,7 +5,6 @@ import {Test, console} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
 import {ChainlinkResolver} from "../src/ChainlinkResolver.sol";
-import {UpDownAutoCycler} from "../src/UpDownAutoCycler.sol";
 import {MockUSDT} from "../src/mocks/MockUSDT.sol";
 import {MockAggregatorV3} from "../src/mocks/MockAggregatorV3.sol";
 import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV3} from "../src/interfaces/IVerifierProxy.sol";

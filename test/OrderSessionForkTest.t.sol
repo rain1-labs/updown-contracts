@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
 import {MockUSDT} from "../src/mocks/MockUSDT.sol";

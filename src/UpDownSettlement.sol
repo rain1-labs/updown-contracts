@@ -328,6 +328,9 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         returns (uint256 marketId)
     {
         uint64 start = uint64(block.timestamp);
+        // casting to 'uint64' is safe because the only caller is the cycler (`onlyAutocycler`), which
+        // passes one of its constructor-fixed slot durations (300 / 900 / 3600 seconds).
+        // forge-lint: disable-next-line(unsafe-typecast)
         uint64 end = start + uint64(duration);
         return _createMarket(pairId, duration, strikePrice, start, end);
     }
@@ -355,10 +358,16 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
             cashDownFlow: 0,
             startTime: startTime,
             endTime: endTime,
+            // casting to 'uint32' is safe because `duration` is one of the cycler's
+            // constructor-fixed slot lengths (300 / 900 / 3600) — see `Market.duration` above.
+            // forge-lint: disable-next-line(unsafe-typecast)
             duration: uint32(duration),
             winner: 0,
             resolved: false,
             settled: false,
+            // casting to 'int128' is safe because the cycler range-checks the strike against
+            // type(int128).min/max and reverts with `StrikeOverflow` before calling in (F-06).
+            // forge-lint: disable-next-line(unsafe-typecast)
             strikePrice: int128(strikePrice),
             settlementPrice: 0
         });
@@ -894,6 +903,10 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         if (block.timestamp < uint256(m.endTime)) revert MarketNotOpen();
         if (winner != OPTION_UP && winner != OPTION_DOWN) revert InvalidWinner();
 
+        // casting to 'int128' is safe because `settlementPrice` is a DON `ReportV3.price` relayed by
+        // the resolver, already guarded positive there, and carries 1e18-scaled ETH/BTC quotes (~1e21)
+        // against an int128 ceiling of ~1.7e38. Same headroom argument as the cycler's F-06 strike check.
+        // forge-lint: disable-next-line(unsafe-typecast)
         m.settlementPrice = int128(settlementPrice);
         m.winner = winner;
         m.resolved = true;

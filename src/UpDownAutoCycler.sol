@@ -329,11 +329,21 @@ contract UpDownAutoCycler is Ownable2Step {
                         // `signedReport` is empty here — coordinator fills it in
                         // before calling performUpkeep.
                         uint256 lastStart = pairTfLastCreated[pid][ti];
-                        uint256 plannedStart =
-                            lastStart == 0 ? (block.timestamp / tft.duration) * tft.duration : lastStart + tft.duration;
+                        uint256 plannedStart;
+                        if (lastStart == 0) {
+                            // the divide-before-multiply IS the intent: floor `block.timestamp` to
+                            // the enclosing clock-aligned slot boundary. Reordering breaks alignment.
+                            // forge-lint: disable-next-line(divide-before-multiply)
+                            plannedStart = (block.timestamp / tft.duration) * tft.duration;
+                        } else {
+                            plannedStart = lastStart + tft.duration;
+                        }
                         createSlots[ci++] = CreateSlot({
                             pairId: pid,
                             tfIdx: ti,
+                            // casting to 'uint64' is safe because plannedStart is a boundary-aligned
+                            // block.timestamp, which does not reach uint64 for ~5.8e11 years.
+                            // forge-lint: disable-next-line(unsafe-typecast)
                             plannedStart: uint64(plannedStart),
                             signedReport: bytes("")
                         });
@@ -389,8 +399,14 @@ contract UpDownAutoCycler is Ownable2Step {
                 if (permanentSkip && slot.tfIdx < NUM_TIMEFRAMES) {
                     TimeframeConfig storage tft = timeframes[slot.tfIdx];
                     uint256 lastStart = pairTfLastCreated[slot.pairId][slot.tfIdx];
-                    uint256 skippedSlotStart =
-                        lastStart == 0 ? (block.timestamp / tft.duration) * tft.duration : lastStart + tft.duration;
+                    uint256 skippedSlotStart;
+                    if (lastStart == 0) {
+                        // divide-before-multiply is the intended floor-to-slot-boundary alignment.
+                        // forge-lint: disable-next-line(divide-before-multiply)
+                        skippedSlotStart = (block.timestamp / tft.duration) * tft.duration;
+                    } else {
+                        skippedSlotStart = lastStart + tft.duration;
+                    }
                     pairTfLastCreated[slot.pairId][slot.tfIdx] = skippedSlotStart;
                     emit SlotSkippedAfterFailure(slot.pairId, slot.tfIdx, skippedSlotStart);
                 }
@@ -447,6 +463,7 @@ contract UpDownAutoCycler is Ownable2Step {
         uint256 plannedStart;
         if (lastStart == 0) {
             // First create on this (pair, tf): align to the current boundary.
+            // forge-lint: disable-next-line(divide-before-multiply)
             plannedStart = (nowTs / tf.duration) * tf.duration;
         } else {
             // Continuing cycle: next slot follows the previous one exactly.
@@ -477,12 +494,17 @@ contract UpDownAutoCycler is Ownable2Step {
         // F-06 int128 range check below still applies; at 1e18 atomic
         // representing ETH/BTC prices, the values fit comfortably in
         // int128 (~9.2e36 max).
+        // casting to 'uint64' is safe because plannedStart is a boundary-aligned block.timestamp.
+        // forge-lint: disable-next-line(unsafe-typecast)
         int256 strike = resolver.captureStrike(pairId, signedReport, uint64(plannedStart));
 
         if (strike > type(int128).max || strike < type(int128).min) {
             revert StrikeOverflow(strike);
         }
 
+        // casting to 'uint64' is safe because both are boundary-aligned block.timestamp values
+        // (`end` = plannedStart + a fixed 300/900/3600 slot).
+        // forge-lint: disable-next-line(unsafe-typecast)
         uint256 marketId = settlement.createMarket(pairId, tf.duration, strike, uint64(plannedStart), uint64(end));
 
         resolver.registerMarket(marketId, address(settlement), pairId, strike);

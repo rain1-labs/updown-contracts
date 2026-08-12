@@ -79,7 +79,7 @@ contract RemediationV2Test is Test {
         });
     }
 
-    function _sign(Vm.Wallet memory w, UpDownSettlement.Order memory o) internal returns (bytes memory) {
+    function _sign(Vm.Wallet memory w, UpDownSettlement.Order memory o) internal view returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 ss) = vm.sign(w.privateKey, s.orderDigest(o));
         return abi.encodePacked(r, ss, v);
     }
@@ -99,7 +99,7 @@ contract RemediationV2Test is Test {
         });
     }
 
-    function _signAuth(Vm.Wallet memory w, UpDownSettlement.MintAuth memory a) internal returns (bytes memory) {
+    function _signAuth(Vm.Wallet memory w, UpDownSettlement.MintAuth memory a) internal view returns (bytes memory) {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", s.DOMAIN_SEPARATOR(), s.hashMintAuth(a)));
         (uint8 v, bytes32 r, bytes32 ss) = vm.sign(w.privateKey, digest);
         return abi.encodePacked(r, ss, v);
@@ -304,7 +304,7 @@ contract RemediationV2Test is Test {
         Vm.Wallet memory makerW,
         UpDownSettlement.Order memory takerO,
         Vm.Wallet memory takerW
-    ) internal returns (UpDownSettlement.FillInputs memory f) {
+    ) internal view returns (UpDownSettlement.FillInputs memory f) {
         f = UpDownSettlement.FillInputs({
             makerOrder: makerO,
             makerSignature: _sign(makerW, makerO),

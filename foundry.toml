@@ -13,6 +13,34 @@ fs_permissions = [{ access = "write", path = "./deployments" }]
 [profile.default.fmt]
 line_length = 120
 
+# `forge build` runs the linter. Every finding that survives here would be a real
+# production-code defect, so the two escape hatches below are deliberately narrow
+# and everything else is fixed at the source (or justified with an inline
+# `forge-lint: disable-next-line(...)` comment explaining why the cast is safe).
+[lint]
+# Lint the deployed contracts only. Test fixtures and the deploy script build
+# malformed reports and hand-scaled fee maths on purpose — unchecked timestamp
+# casts and floor-to-boundary integer division are the point of those files, not
+# a defect, and annotating ~60 fixture lines would bury the signal from `src/`.
+# (the glob must reach the file itself — a bare `test/**` matches nothing here.)
+ignore = ["test/**/*.sol", "script/**/*.sol"]
+# Style-only lints that conflict with conventions we cannot change:
+#   screaming-snake-case-immutable — our immutables are `public`, so their names
+#     are ABI getters (`usdt()`, `resolver()`, `verifierProxy()`, ...) that the
+#     bot, frontend and deployment records already bind to. Renaming is a
+#     breaking ABI change to audited, deployed contracts.
+#   mixed-case-function — `IVerifierProxy` / `MockVerifierProxy` mirror
+#     Chainlink's deployed ABI (`s_feeManager()`), where the name IS the
+#     selector; renaming would call into nothing.
+#   asm-keccak256, unwrapped-modifier-logic — gas / code-size micro-rewrites of
+#     audited code paths. Not worth re-opening the audit surface over.
+exclude_lints = [
+    "screaming-snake-case-immutable",
+    "mixed-case-function",
+    "asm-keccak256",
+    "unwrapped-modifier-logic",
+]
+
 # Gate 3 real-DON fork test only. Inherits the default profile's compiler
 # settings and adds `ffi = true` so `UpDownForkTest` can shell out to
 # `script/fetch_streams_report.mjs`. Kept OUT of the default profile so the

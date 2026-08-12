@@ -556,6 +556,9 @@ contract ChainlinkResolver is Ownable2Step {
         int256 settlementPrice = int256(report.price);
         uint256 winningOption = settlementPrice > info.strikePrice ? OPTION_UP : OPTION_DOWN;
 
+        // casting to 'uint8' is safe because `winningOption` is assigned OPTION_UP (1) or
+        // OPTION_DOWN (2) one line above and has no other source.
+        // forge-lint: disable-next-line(unsafe-typecast)
         try IUpDownSettlement(info.settlement).resolve(marketId, settlementPrice, uint8(winningOption)) {
             info.resolved = true;
             emit MarketResolved(marketId, winningOption, settlementPrice, info.strikePrice);

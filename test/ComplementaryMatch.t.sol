@@ -84,7 +84,7 @@ contract ComplementaryMatchTest is Test {
         });
     }
 
-    function _sign(Vm.Wallet memory w, UpDownSettlement.Order memory o) internal returns (bytes memory) {
+    function _sign(Vm.Wallet memory w, UpDownSettlement.Order memory o) internal view returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 ss) = vm.sign(w.privateKey, s.orderDigest(o));
         return abi.encodePacked(r, ss, v);
     }
@@ -100,7 +100,7 @@ contract ComplementaryMatchTest is Test {
         uint256 fillAmount,
         uint256 platformFee,
         uint256 makerFee
-    ) internal returns (UpDownSettlement.FillInputs memory f) {
+    ) internal view returns (UpDownSettlement.FillInputs memory f) {
         f = UpDownSettlement.FillInputs({
             makerOrder: makerO,
             makerSignature: _sign(makerW, makerO),
