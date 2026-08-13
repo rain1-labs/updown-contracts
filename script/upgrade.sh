@@ -31,15 +31,23 @@
 #   --yes          skip the confirmation prompts (prod still confirms the deploy)
 #   --skip-deploy  run phases 1-5 only, then stop and print the deploy command
 #   --skip-drain   do NOT wait for open markets — see below
+#   --orphan-collateral
+#                  stands in for the typed ORPHAN confirmation, for unattended
+#                  runs. Only meaningful with --skip-drain.
 #   --poll <sec>   drain poll interval (default 60)
 #
 # --skip-drain abandons every open market: after setResolver they can be settled
 # by neither resolver, so any collateral in them is unredeemable until an
 # operator re-registers each one on the new resolver. It is defensible when the
-# open markets are empty — a quiet dev environment — and reckless otherwise, so
-# the flag refuses to run unattended, prints the collateral at stake, requires a
-# typed confirmation when any is found, and emits the recovery commands for
-# every market it strands.
+# open markets are empty — a quiet dev environment — and a deliberate cost
+# otherwise, so the flag prints the collateral at stake, requires a typed
+# confirmation when any is found, and emits the recovery commands for every
+# market it strands.
+#
+# --yes does not satisfy that confirmation: a run left unattended must not decide
+# on its own to strand someone's position. --orphan-collateral is the separate,
+# explicit way to say it, so the choice is always written down in the command
+# rather than inherited from a general-purpose "assume yes".
 
 set -euo pipefail
 
@@ -49,6 +57,7 @@ shift || true
 ASSUME_YES=0
 SKIP_DEPLOY=0
 SKIP_DRAIN=0
+ORPHAN_OK=0
 POLL=60
 
 while [ $# -gt 0 ]; do
@@ -56,6 +65,7 @@ while [ $# -gt 0 ]; do
     --yes) ASSUME_YES=1 ;;
     --skip-deploy) SKIP_DEPLOY=1 ;;
     --skip-drain) SKIP_DRAIN=1 ;;
+    --orphan-collateral) ORPHAN_OK=1 ;;
     --poll) POLL="$2"; shift ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -63,7 +73,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$ENVNAME" != "dev" ] && [ "$ENVNAME" != "prod" ]; then
-  echo "usage: $0 <dev|prod> [--yes] [--skip-deploy] [--skip-drain] [--poll <sec>]" >&2
+  echo "usage: $0 <dev|prod> [--yes] [--skip-deploy] [--skip-drain] [--orphan-collateral] [--poll <sec>]" >&2
   exit 2
 fi
 
@@ -203,11 +213,16 @@ if [ "$SKIP_DRAIN" = "1" ]; then
       while read -r MID PAIR STRIKE T; do
         [ "$T" -gt 0 ] && printf '        market %-8s notional %s\n' "$MID" "$T"
       done <"$ORPHAN_FILE"
-      # Real value is on the line: never let --yes alone carry this.
-      printf '\n  %sType ORPHAN to strand the collateral above:%s ' "$B" "$RS"
-      typed=""
-      { read -r typed </dev/tty; } 2>/dev/null || read -r typed 2>/dev/null || true
-      [ "$typed" = "ORPHAN" ] || die "not confirmed — drop --skip-drain and let it settle"
+      # Real value is on the line, so --yes alone must never carry this.
+      if [ "$ORPHAN_OK" = "1" ]; then
+        warn "--orphan-collateral given: stranding the above without prompting"
+      else
+        printf '\n  %sType ORPHAN to strand the collateral above:%s ' "$B" "$RS"
+        typed=""
+        { read -r typed </dev/tty; } 2>/dev/null || read -r typed 2>/dev/null || true
+        [ "$typed" = "ORPHAN" ] \
+          || die "not confirmed — let it settle, or pass --orphan-collateral to mean it"
+      fi
     else
       ok "none hold collateral — nothing becomes unredeemable"
       confirm "proceed without draining?"
