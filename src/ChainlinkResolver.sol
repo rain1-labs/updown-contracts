@@ -8,7 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {IUpDownSettlement} from "./interfaces/IUpDownSettlement.sol";
-import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV3} from "./interfaces/IVerifierProxy.sol";
+import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV2, ReportV3} from "./interfaces/IVerifierProxy.sol";
 
 /// @title ChainlinkResolver
 /// @notice Reads Chainlink price data and resolves UpDown markets via
@@ -108,6 +108,23 @@ contract ChainlinkResolver is Ownable2Step {
     error NotAuthorizedCaller();
     /// @notice F-2026-17760: requested observation lag exceeds the hard cap (`OBSERVATION_LAG_CAP`).
     error ObservationLagTooLarge(uint256 requested, uint256 cap);
+    /// @notice TWAP swap (2026-08-13): the stream id's schema prefix is not one this
+    ///         resolver can decode. Chainlink encodes the report schema in the first
+    ///         two bytes of the stream id (`0x0002…` = v2, `0x0003…` = v3); only those
+    ///         two are supported, because they are the only schemas whose field layout
+    ///         this contract knows how to read.
+    ///
+    ///         Raised from `configureStreamsFeed` so a mis-schema'd id is rejected at
+    ///         configuration time rather than discovered at resolve time. Pre-fix, the
+    ///         decode was hardcoded to v3 and configuring a v2 id was accepted silently,
+    ///         then reverted inside every `captureStrike`/`resolve` — halting the pair
+    ///         with no on-chain signal that the config was the cause.
+    error UnsupportedReportSchema(bytes32 feedId, uint16 schemaVersion);
+    /// @notice TWAP swap: the verifier returned a payload whose length matches no
+    ///         supported schema. v2 ABI-encodes to 224 bytes, v3 to 288. Defence in
+    ///         depth behind the prefix check — reaching this means the DON returned a
+    ///         report whose shape disagrees with its own stream id.
+    error UnexpectedReportLength(uint256 length);
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
@@ -200,6 +217,19 @@ contract ChainlinkResolver is Ownable2Step {
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
     uint256 public constant OPTION_UP = 1;
     uint256 public constant OPTION_DOWN = 2;
+
+    /// @notice TWAP swap (2026-08-13): supported Data Streams report schemas, as
+    ///         encoded in the leading two bytes of a stream id. v3 is the incumbent
+    ///         Crypto Advanced schema (price + simulated bid/ask); v2 is the same
+    ///         layout without bid/ask, which is what the TWAP streams publish.
+    ///         Both carry `price` at 18 decimals, so the swap is decode-only —
+    ///         no downstream arithmetic changes.
+    uint16 public constant SCHEMA_V2 = 2;
+    uint16 public constant SCHEMA_V3 = 3;
+    /// @notice ABI-encoded length of each supported report. Used to cross-check the
+    ///         verifier's response against the schema the stream id advertises.
+    uint256 private constant REPORT_V2_LENGTH = 7 * 32;
+    uint256 private constant REPORT_V3_LENGTH = 9 * 32;
 
     // ── State ───────────────────────────────────────────────────────────
     AggregatorV3Interface public immutable sequencerFeed;
@@ -295,7 +325,16 @@ contract ChainlinkResolver is Ownable2Step {
     ///         a Streams-only pair registers without a Data Feeds co-requisite;
     ///         a market whose pair has a streams feed-id of zero still fails to
     ///         RESOLVE with `StreamsFeedNotConfigured()` — loud, not silent.
+    ///
+    ///         TWAP swap (2026-08-13): the id's schema prefix is now validated here.
+    ///         `bytes32(0)` is still accepted — that is the "unset" sentinel the
+    ///         `registerMarket` gate and `StreamsFeedNotConfigured` check both key
+    ///         off, so clearing a pair must stay possible.
     function configureStreamsFeed(bytes32 pairId, bytes32 feedId) external onlyOwner {
+        if (feedId != bytes32(0)) {
+            uint16 schema = _schemaOf(feedId);
+            if (schema != SCHEMA_V2 && schema != SCHEMA_V3) revert UnsupportedReportSchema(feedId, schema);
+        }
         streamsFeedId[pairId] = feedId;
         emit StreamsFeedConfigured(pairId, feedId);
     }
@@ -425,37 +464,24 @@ contract ChainlinkResolver is Ownable2Step {
         bytes32 wantFeedId = streamsFeedId[pairId];
         if (wantFeedId == bytes32(0)) revert StreamsFeedNotConfigured();
 
-        bytes memory parameterPayload = _payVerificationFee(signedReport);
-        bytes memory verifierResponse = verifierProxy.verify(signedReport, parameterPayload);
-        ReportV3 memory report = abi.decode(verifierResponse, (ReportV3));
-
-        if (report.feedId != wantFeedId) revert ReportFeedIdMismatch(wantFeedId, report.feedId);
-        if (uint256(report.expiresAt) < block.timestamp) {
-            revert ReportExpired(uint256(report.expiresAt), block.timestamp);
-        }
+        // TWAP swap (2026-08-13): verify + schema-dispatched decode + feedId /
+        // expiry / positivity checks all live in `_verifyReport` now.
+        (uint256 obs, int256 reportPrice) = _verifyReport(signedReport, wantFeedId);
 
         // Strike window: symmetric ±MAX_STRIKE_REPORT_LAG around startTime.
         // Differs from the settlement-side window which is asymmetric
         // (`endTime - LAG <= obs <= endTime`) because strike is anchored AT
         // slot boundary, settlement is anchored AT-OR-BEFORE close.
-        uint256 obs = uint256(report.observationsTimestamp);
         uint256 startTs = uint256(startTime);
         if (obs + maxStrikeReportLag < startTs || obs > startTs + maxStrikeReportLag) {
             revert ReportObservationOutOfStrikeWindow(startTime, obs);
         }
 
-        // F-2026-17759: reject a malformed (zero / negative) DON price on the
-        // live Streams path. The original sign guard lived only in the legacy
-        // `_getLatestPrice` (Data Feeds) view, which the post-Streams-migration
-        // strike path no longer uses — production captures the strike from
-        // `report.price` directly, so it gets the same positivity guard.
-        if (report.price <= 0) revert InvalidPrice();
-
-        strikePrice = int256(report.price);
+        strikePrice = reportPrice;
         strikeCaptured[pairId][startTime] = true;
         capturedStrike[pairId][startTime] = strikePrice;
 
-        emit StrikeCaptured(pairId, startTime, strikePrice, report.observationsTimestamp);
+        emit StrikeCaptured(pairId, startTime, strikePrice, uint64(obs));
     }
 
     // ── Public: Data Streams report-bound resolution ─────────────────────
@@ -522,38 +548,23 @@ contract ChainlinkResolver is Ownable2Step {
         // RewardManager to approve. When the FeeManager is unset (testnet
         // or subscription-billed mainnets), `parameterPayload` is empty
         // and `verify` proceeds without a fee deduction.
-        bytes memory parameterPayload = _payVerificationFee(signedReport);
-        bytes memory verifierResponse = verifierProxy.verify(signedReport, parameterPayload);
-
-        // Crypto streams (BTC/USD, ETH/USD) always decode as V3. If we
-        // ever add RWA pairs (V8), branch here on a stream-id → schema
-        // mapping. Not needed in v1; flagged for v1.1.
-        ReportV3 memory report = abi.decode(verifierResponse, (ReportV3));
-
-        if (report.feedId != wantFeedId) revert ReportFeedIdMismatch(wantFeedId, report.feedId);
-        if (uint256(report.expiresAt) < block.timestamp) {
-            revert ReportExpired(uint256(report.expiresAt), block.timestamp);
-        }
+        // TWAP swap (2026-08-13): the decode is no longer hardcoded to V3. The stream
+        // id's schema prefix selects the layout — v3 for the incumbent spot streams,
+        // v2 for the TWAP streams, which omit bid/ask. An RWA schema (v8) would slot
+        // in the same way, though the resolver has no RWA pairs today.
+        (uint256 obs, int256 reportPrice) = _verifyReport(signedReport, wantFeedId);
 
         // Observation window: `endTime - LAG <= observationsTimestamp <= endTime`.
         // Upper bound (== endTime) rejects post-close observations that
         // would price the market on a snapshot after it closed. Lower
         // bound rejects reports too old to be representative of the
         // close — caller should fetch a fresher one from the API.
-        uint256 obs = uint256(report.observationsTimestamp);
         uint256 endTs = uint256(m.endTime);
         if (obs > endTs || obs + maxReportObservationLag < endTs) {
             revert ReportObservationOutOfWindow(endTs, obs);
         }
 
-        // F-2026-17759: reject a malformed (zero / negative) DON price on the
-        // live Streams path. The original sign guard lived only in the legacy
-        // `_getLatestPrice` (Data Feeds) view, which settlement no longer uses —
-        // production resolves the binary outcome from `report.price` directly,
-        // so it gets the same positivity guard before deciding UP/DOWN.
-        if (report.price <= 0) revert InvalidPrice();
-
-        int256 settlementPrice = int256(report.price);
+        int256 settlementPrice = reportPrice;
         uint256 winningOption = settlementPrice > info.strikePrice ? OPTION_UP : OPTION_DOWN;
 
         try IUpDownSettlement(info.settlement).resolve(marketId, settlementPrice, uint8(winningOption)) {
@@ -565,6 +576,73 @@ contract ChainlinkResolver is Ownable2Step {
             // instead of in off-chain reconciliation logs only.
             emit ResolveFailed(marketId, settlementPrice, reason);
         }
+    }
+
+    /// @dev TWAP swap (2026-08-13): Chainlink encodes the report schema version in the
+    ///      leading two bytes of a stream id — `0x0003…` for Crypto Advanced (v3),
+    ///      `0x0002…` for the bid/ask-less v2 that the TWAP streams publish under.
+    function _schemaOf(bytes32 feedId) internal pure returns (uint16) {
+        return uint16(bytes2(feedId));
+    }
+
+    /// @dev TWAP swap (2026-08-13): pay, verify, decode and validate a signed report,
+    ///      returning only the two fields the resolver actually consumes.
+    ///
+    ///      Consolidated out of `captureStrike` and `resolve`, which previously carried
+    ///      byte-identical copies of this sequence. Beyond removing the duplication, a
+    ///      single implementation means the strike and settlement paths cannot drift on
+    ///      schema handling — and a market whose strike and settlement were validated
+    ///      under different rules is exactly the failure mode that pays out the wrong
+    ///      side without reverting.
+    ///
+    ///      Schema dispatch reads the prefix of `wantFeedId` (the id the owner
+    ///      configured), not of the returned report, so a caller cannot steer the
+    ///      decoder by submitting a differently-prefixed blob. The `feedId` equality
+    ///      check below then binds the report to the configured stream regardless.
+    ///
+    ///      Checks applied here, in order:
+    ///        1. response length agrees with the advertised schema
+    ///        2. `feedId` matches the pair's configured stream
+    ///        3. report has not expired
+    ///        4. price is strictly positive (F-2026-17759)
+    ///      The observation-window check stays at the call sites: it is asymmetric for
+    ///      settlement (`[endTime - lag, endTime]`) and symmetric for strike
+    ///      (`startTime ± lag`), so it cannot be shared.
+    function _verifyReport(bytes memory signedReport, bytes32 wantFeedId)
+        internal
+        returns (uint256 observationsTimestamp, int256 price)
+    {
+        bytes memory parameterPayload = _payVerificationFee(signedReport);
+        bytes memory verifierResponse = verifierProxy.verify(signedReport, parameterPayload);
+
+        bytes32 gotFeedId;
+        uint32 expiresAt;
+        uint32 obs;
+        int192 rawPrice;
+
+        uint16 schema = _schemaOf(wantFeedId);
+        if (schema == SCHEMA_V3) {
+            if (verifierResponse.length != REPORT_V3_LENGTH) revert UnexpectedReportLength(verifierResponse.length);
+            ReportV3 memory r = abi.decode(verifierResponse, (ReportV3));
+            (gotFeedId, obs, expiresAt, rawPrice) = (r.feedId, r.observationsTimestamp, r.expiresAt, r.price);
+        } else if (schema == SCHEMA_V2) {
+            if (verifierResponse.length != REPORT_V2_LENGTH) revert UnexpectedReportLength(verifierResponse.length);
+            ReportV2 memory r = abi.decode(verifierResponse, (ReportV2));
+            (gotFeedId, obs, expiresAt, rawPrice) = (r.feedId, r.observationsTimestamp, r.expiresAt, r.price);
+        } else {
+            // Unreachable while `configureStreamsFeed` is the only writer of
+            // `streamsFeedId`, which rejects unsupported prefixes. Kept so the
+            // decode can never fall through to an untyped path.
+            revert UnsupportedReportSchema(wantFeedId, schema);
+        }
+
+        if (gotFeedId != wantFeedId) revert ReportFeedIdMismatch(wantFeedId, gotFeedId);
+        if (uint256(expiresAt) < block.timestamp) revert ReportExpired(uint256(expiresAt), block.timestamp);
+        // F-2026-17759: reject a malformed (zero / negative) DON price before it can
+        // decide an UP/DOWN outcome or anchor a strike.
+        if (rawPrice <= 0) revert InvalidPrice();
+
+        return (uint256(obs), int256(rawPrice));
     }
 
     /// @dev Pay the LINK verification fee, returning the `parameterPayload`

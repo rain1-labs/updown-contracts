@@ -72,6 +72,33 @@ interface IFeeManager {
         returns (FeeManagerAsset memory fee, FeeManagerAsset memory reward, uint256 totalDiscount);
 }
 
+/// @notice Crypto Streams report layout (schema v2). Field-for-field
+///         identical to `ReportV3` minus the trailing `bid` / `ask` pair,
+///         so it ABI-encodes to 7 words (224 bytes) against V3's 9 (288).
+///
+///         Added 2026-08-13 for the TWAP swap. Chainlink's TWAP streams
+///         (`BTC / USD - TWAP: 30s`, `ETH / USD - TWAP: 30s`) publish under
+///         v2, not v3 — a time-weighted average has no order book behind it,
+///         so there is no simulated bid/ask to report. Verified against the
+///         live mainnet API: both TWAP stream IDs return 224-byte reports
+///         while the incumbent v3 spot streams return 288.
+///
+///         The schema is encoded in the first two bytes of the stream ID:
+///         `0x0002…` for v2, `0x0003…` for v3. `ChainlinkResolver` reads
+///         that prefix to pick a decoder — see `_verifyReport`.
+struct ReportV2 {
+    bytes32 feedId;
+    uint32 validFromTimestamp;
+    uint32 observationsTimestamp;
+    uint192 nativeFee;
+    uint192 linkFee;
+    uint32 expiresAt;
+    /// @notice int192 price at `observationsTimestamp`, 18 decimals —
+    ///         the same scale as `ReportV3.price`, so nothing downstream
+    ///         of the decode changes when a pair moves from v3 to v2.
+    int192 price;
+}
+
 /// @notice Crypto Streams report layout (schema v3). Returned ABI-encoded
 ///         by `IVerifierProxy.verify`. Field semantics:
 ///
@@ -93,9 +120,12 @@ interface IFeeManager {
 ///           verified on-chain. Past this, the Verifier Proxy itself
 ///           rejects the report.
 ///         - `price`: int192 price of the asset at `observationsTimestamp`,
-///           in 8 decimals (matching the legacy Chainlink Data Feeds
-///           BTC/USD / ETH/USD scale that UpDown's `strikePrice`
-///           comparison already uses).
+///           in **18** decimals. (This comment previously said 8, matching
+///           the legacy Data Feeds aggregator scale; that was wrong and
+///           contradicted `ChainlinkResolver`'s own docstring, which
+///           correctly describes the 1e18 Streams scale as the point of
+///           the 2026-05-16 strike migration. Confirmed against live
+///           mainnet reports: BTC/USD returns ~6.35e22 for ~$63.5k.)
 ///         - `bid` / `ask`: spread context. Not used by the resolver;
 ///           kept for completeness / future use.
 struct ReportV3 {
