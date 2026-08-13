@@ -4,6 +4,7 @@
   "private": true,
   "description": "Task runner only. No dependencies — this repo is pure Foundry. Do not add hardhat back.",
   "scripts": {
+    "preflight:prod": "set -a && . ./.env.prod && set +a && [ -n \"$EXISTING_SETTLEMENT_ADDRESS\" ] || { echo 'EXISTING_SETTLEMENT_ADDRESS is unset. For a resolver/cycler upgrade it MUST be set to the live Settlement, or deploy:prod creates a NEW Settlement and strands all user collateral on the old one.'; exit 1; } && forge script script/UpgradePreflight.s.sol --rpc-url \"$ARBITRUM_RPC_URL\"",
     "simulate:dev": "set -a && . ./.env.dev && set +a && DEPLOY_LABEL=dev forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\"",
     "simulate:prod": "set -a && . ./.env.prod && set +a && DEPLOY_LABEL=prod forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\"",
     "deploy:dev": "set -a && . ./.env.dev && set +a && [ -n \"$ARBISCAN_API_KEY\" ] || { echo 'ARBISCAN_API_KEY is empty — --verify would fail AFTER broadcasting. Set it or drop --verify.'; exit 1; } && WRITE_DEPLOYMENT_RECORD=1 DEPLOY_LABEL=dev forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --broadcast --verify --retries 10 --delay 20",
