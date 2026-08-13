@@ -5,31 +5,23 @@ import {Test, StdInvariant, Vm} from "forge-std/Test.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
 
-/// @notice PR-O Step 2 audit-defending invariant fuzz.
+/// @notice Remediation V2 conservation invariants (non-custodial share model).
 ///
-/// Invariant under test:
-///   usdt.balanceOf(settlement) == sum_over_unsettled(marketRetained[mid])
+/// Invariants under test, holding at every external-call boundary:
+///   (1) usdt.balanceOf(settlement) == Σ marketRetained[mid]            (global solvency)
+///   (2) unresolved market: marketRetained == optionShares[UP] == optionShares[DOWN]
+///   (3) resolved market:   marketRetained == optionShares[winner]      (winners fully backed)
 ///
-/// "Unsettled" here means `Market.settled == false`. Once
-/// `withdrawSettlement(mid)` runs, the per-market `marketRetained[mid]` is
-/// zeroed AND the USDT is transferred to the relayer, so the equality
-/// holds at every external-call boundary.
-///
-/// The handler exposes the random surface to Foundry's invariant fuzzer:
-/// complementaryMint, complementaryBurn, enterPosition, resolve,
-/// withdrawSettlement. distributeWinnings is off-chain (relayer pays from
-/// its wallet); it doesn't affect the contract's balance invariant.
-///
-/// The fuzzer's targetContract is the handler, not the settlement
-/// directly — this keeps fill-input construction tractable (each handler
-/// method picks valid inputs from a small param space the fuzzer can
-/// search efficiently).
+/// (1) is what proves the protocol can always pay every winner who redeems: the contract never
+/// holds less USDT than it owes. `enterPosition` is balance-neutral (cash moves peer-to-peer), so
+/// only mint / burn / redeem move the contract balance — each by exactly the `marketRetained` delta.
+/// (2)+(3) prove F-2026-17771 (no backing reuse) and F-2026-17776 (backing can't be withdrawn out
+/// from under a live position): shares are only ever created/destroyed as complete sets, and a fill
+/// merely transfers an existing share, so the per-option totals can never diverge from the backing.
 contract UpDownPROInvariant is StdInvariant, Test {
-    bytes32 internal constant PAIR = keccak256("BTC/USD");
-
     ERC20Mock internal usdt;
     UpDownSettlement internal s;
-    PROComplementaryHandler internal handler;
+    ShareHandler internal handler;
 
     address internal owner = address(this);
     address internal autocycler = makeAddr("auto-inv");
@@ -40,70 +32,61 @@ contract UpDownPROInvariant is StdInvariant, Test {
     function setUp() public {
         vm.warp(1_700_000_000);
         usdt = new ERC20Mock();
-        s = new UpDownSettlement(usdt, owner, 70, 80);
+        s = new UpDownSettlement(usdt, owner);
         s.setAutocycler(autocycler);
         s.setResolver(resolver);
         s.setRelayer(relayer);
         s.setTreasury(treasury);
 
-        handler = new PROComplementaryHandler(s, usdt, autocycler, resolver, relayer);
-        usdt.mint(address(handler), 100_000_000e18);
-        // Pre-create a fixed pool of markets the handler can index into.
+        handler = new ShareHandler(s, usdt, autocycler, resolver, relayer);
         handler.bootstrap();
 
-        // Constrain the fuzzer to handler methods (not raw settlement).
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](5);
+        bytes4[] memory selectors = new bytes4[](7);
         selectors[0] = handler.fuzzMint.selector;
         selectors[1] = handler.fuzzBurn.selector;
         selectors[2] = handler.fuzzFill.selector;
         selectors[3] = handler.fuzzResolve.selector;
-        selectors[4] = handler.fuzzWithdraw.selector;
+        selectors[4] = handler.fuzzRedeem.selector;
+        selectors[5] = handler.fuzzMintMatch.selector;
+        selectors[6] = handler.fuzzMergeMatch.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
-    /// @notice The conservation invariant. Sum of per-market retained
-    ///         across all unsettled markets equals the contract's USDT
-    ///         balance MINUS any accumulated dmm rebates owed (which
-    ///         live in `dmmRebateAccumulated` and are paid from treasury,
-    ///         not from the contract — so they don't appear here).
-    ///
-    ///         Settled markets contribute zero (marketRetained zeroed on
-    ///         withdraw, USDT already sent to relayer).
     function invariant_balanceEqualsSumOfRetained() public view {
         uint256 sumRetained = 0;
-        uint256 numMarkets = handler.marketCount();
-        for (uint256 i = 0; i < numMarkets; i++) {
-            uint256 mid = handler.marketIdAt(i);
-            sumRetained += s.marketRetained(mid);
+        uint256 n = handler.marketCount();
+        for (uint256 i = 0; i < n; i++) {
+            sumRetained += s.marketRetained(handler.marketIdAt(i));
         }
-        assertEq(
-            usdt.balanceOf(address(s)),
-            sumRetained,
-            "balance(settlement) == sum(marketRetained over all markets)"
-        );
+        assertEq(usdt.balanceOf(address(s)), sumRetained, "balance == sum(marketRetained)");
     }
 
-    /// @notice Per-market retained never goes negative — Solidity 0.8
-    ///         underflow protection makes this true by construction inside
-    ///         the contract, but checking here pins the property even if a
-    ///         future PR adds `unchecked` blocks.
-    function invariant_perMarketRetainedNonNegative() public view {
-        uint256 numMarkets = handler.marketCount();
-        for (uint256 i = 0; i < numMarkets; i++) {
+    function invariant_retainedBacksOutstandingShares() public view {
+        uint256 n = handler.marketCount();
+        for (uint256 i = 0; i < n; i++) {
             uint256 mid = handler.marketIdAt(i);
-            // Use a uint256 read — if it ever overflowed via unchecked the
-            // value would be enormous; check it's a plausible scale.
-            uint256 r = s.marketRetained(mid);
-            assertLe(r, 100_000_000e18, "retained stays within handler-funded ceiling");
+            uint256 retained = s.marketRetained(mid);
+            uint256 up = s.optionShares(mid, 1);
+            uint256 down = s.optionShares(mid, 2);
+            UpDownSettlement.Market memory m = s.getMarket(mid);
+            if (!m.resolved) {
+                assertEq(retained, up, "unresolved: retained == UP shares");
+                assertEq(retained, down, "unresolved: retained == DOWN shares");
+            } else {
+                assertEq(retained, s.optionShares(mid, m.winner), "resolved: retained == winning shares");
+                // F-2026-17954: the losing side is zeroed at resolution and never re-grows.
+                uint8 loser = m.winner == 1 ? 2 : 1;
+                assertEq(s.optionShares(mid, loser), 0, "resolved: loser shares zeroed (F-2026-17954)");
+            }
         }
     }
 }
 
-/// @notice Action handler exposing fuzz-friendly methods. Owns its own
-///         pool of pre-funded actors so the fuzzer doesn't waste sequences
-///         on "no approval" reverts.
-contract PROComplementaryHandler is Test {
+/// @notice Action handler. Owns a pool of signing wallets used as both makers (sellers) and takers
+///         (buyers), pre-funded + approved, so the fuzzer spends its sequences on real state
+///         transitions rather than bouncing off approvals.
+contract ShareHandler is Test {
     UpDownSettlement internal s;
     ERC20Mock internal usdt;
     address internal autocycler;
@@ -111,16 +94,12 @@ contract PROComplementaryHandler is Test {
     address internal relayer;
 
     uint256[] public markets;
-    Vm.Wallet[] internal makers;
-    address[] internal actors;
+    Vm.Wallet[] internal wallets;
+    uint256 internal nonceCounter;
 
-    constructor(
-        UpDownSettlement _s,
-        ERC20Mock _usdt,
-        address _autocycler,
-        address _resolver,
-        address _relayer
-    ) {
+    bytes32 internal constant PAIR = keccak256("INV-PAIR");
+
+    constructor(UpDownSettlement _s, ERC20Mock _usdt, address _autocycler, address _resolver, address _relayer) {
         s = _s;
         usdt = _usdt;
         autocycler = _autocycler;
@@ -129,30 +108,18 @@ contract PROComplementaryHandler is Test {
     }
 
     function bootstrap() public {
-        // 4 markets, 4 makers (with known keys for signing), 4 actors.
         for (uint256 i = 0; i < 4; i++) {
             vm.prank(autocycler);
-            uint256 mid = s.createMarket(PAIR_BYTES(), 3600, 50_000e8);
-            markets.push(mid);
+            // 1-hour markets so the active window stays open across a long fuzz run.
+            markets.push(s.createMarket(PAIR, 3600, 50_000e8));
         }
-        for (uint256 i = 0; i < 4; i++) {
-            Vm.Wallet memory m = vm.createWallet(string(abi.encodePacked("m", i)));
-            usdt.mint(m.addr, 1_000_000e18);
-            vm.prank(m.addr);
+        for (uint256 i = 0; i < 5; i++) {
+            Vm.Wallet memory w = vm.createWallet(string(abi.encodePacked("w", i)));
+            usdt.mint(w.addr, 1_000_000e18);
+            vm.prank(w.addr);
             usdt.approve(address(s), type(uint256).max);
-            makers.push(m);
+            wallets.push(w);
         }
-        for (uint256 i = 0; i < 4; i++) {
-            address a = makeAddr(string(abi.encodePacked("actor", i)));
-            usdt.mint(a, 1_000_000e18);
-            vm.prank(a);
-            usdt.approve(address(s), type(uint256).max);
-            actors.push(a);
-        }
-    }
-
-    function PAIR_BYTES() internal pure returns (bytes32) {
-        return keccak256("INV-PAIR");
     }
 
     function marketCount() external view returns (uint256) {
@@ -163,120 +130,229 @@ contract PROComplementaryHandler is Test {
         return markets[i];
     }
 
-    // ── Fuzz actions ────────────────────────────────────────────────────
-
-    function fuzzMint(uint256 marketIdx, uint256 actorIdx, uint256 amount) external {
-        uint256 mid = markets[marketIdx % markets.length];
-        address minter = actors[actorIdx % actors.length];
-        // Skip resolved markets (would revert in normal use).
+    function _activeMarket(uint256 marketIdx) internal view returns (uint256 mid, bool ok) {
+        mid = markets[marketIdx % markets.length];
         UpDownSettlement.Market memory m = s.getMarket(mid);
-        if (m.resolved || block.timestamp >= uint256(m.endTime)) return;
+        ok = !m.resolved && block.timestamp < uint256(m.endTime);
+    }
+
+    // ── Mint a complete set (self-service path, F-2026-17772). ──
+    function fuzzMint(uint256 marketIdx, uint256 walletIdx, uint256 amount) external {
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory w = wallets[walletIdx % wallets.length];
         amount = bound(amount, 1, 1_000e18);
-        if (usdt.balanceOf(minter) < amount) return;
-        vm.prank(relayer);
-        s.complementaryMint(mid, amount, minter);
+        if (usdt.balanceOf(w.addr) < amount) return;
+        vm.prank(w.addr);
+        s.mint(mid, amount);
     }
 
-    function fuzzBurn(uint256 marketIdx, uint256 actorIdx, uint256 amount) external {
-        uint256 mid = markets[marketIdx % markets.length];
-        address holder = actors[actorIdx % actors.length];
-        UpDownSettlement.Market memory m = s.getMarket(mid);
-        if (m.resolved) return;
-        uint256 retained = s.marketRetained(mid);
-        if (retained == 0) return;
-        amount = bound(amount, 1, retained);
-        vm.prank(relayer);
-        s.complementaryBurn(mid, amount, holder);
+    // ── Burn a complete set the wallet actually holds. ──
+    function fuzzBurn(uint256 marketIdx, uint256 walletIdx, uint256 amount) external {
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory w = wallets[walletIdx % wallets.length];
+        uint256 up = s.sharesOf(mid, w.addr, 1);
+        uint256 down = s.sharesOf(mid, w.addr, 2);
+        uint256 maxBurn = up < down ? up : down;
+        if (maxBurn == 0) return;
+        amount = bound(amount, 1, maxBurn);
+        vm.prank(w.addr);
+        s.burn(mid, amount);
     }
 
+    // ── Transfer a share via a two-sided signed fill (F-2026-17756/17757). ──
     function fuzzFill(
         uint256 marketIdx,
-        uint256 makerIdx,
-        uint256 takerIdx,
+        uint256 sellerIdx,
+        uint256 buyerIdx,
         uint8 option,
         uint16 priceBps,
-        uint256 fillAmount,
-        uint256 nonce
+        uint256 fillAmount
     ) external {
-        uint256 mid = markets[marketIdx % markets.length];
-        Vm.Wallet memory m = makers[makerIdx % makers.length];
-        address taker = actors[takerIdx % actors.length];
-        UpDownSettlement.Market memory mkt = s.getMarket(mid);
-        if (mkt.resolved || block.timestamp >= uint256(mkt.endTime)) return;
-
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory seller = wallets[sellerIdx % wallets.length];
+        Vm.Wallet memory buyer = wallets[buyerIdx % wallets.length];
+        if (seller.addr == buyer.addr) return;
         option = uint8(bound(uint256(option), 1, 2));
+        uint256 held = s.sharesOf(mid, seller.addr, option);
+        if (held == 0) return;
+        fillAmount = bound(fillAmount, 1, held);
         priceBps = uint16(bound(uint256(priceBps), 1, 9999));
-        fillAmount = bound(fillAmount, 1, 100e18);
-
         uint256 cashPart = (uint256(priceBps) * fillAmount) / 10000;
-        uint256 mintBackingDelta = fillAmount - cashPart;
-        // Need enough backing or the fill reverts (which we treat as a
-        // valid "skip"); to maximize coverage, ensure backing first by
-        // best-effort pre-minting if needed.
-        if (s.marketRetained(mid) < mintBackingDelta) {
-            uint256 short = mintBackingDelta - s.marketRetained(mid);
-            address backer = actors[0];
-            if (usdt.balanceOf(backer) >= short) {
-                vm.prank(relayer);
-                s.complementaryMint(mid, short, backer);
-            } else {
-                return;
-            }
-        }
+        if (usdt.balanceOf(buyer.addr) < cashPart) return;
 
-        UpDownSettlement.Order memory order = UpDownSettlement.Order({
-            maker: m.addr,
+        UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
+            maker: seller.addr,
             market: mid,
-            option: uint256(option),
-            side: 0, // BUY-side maker — buyer is the maker
+            option: option,
+            side: 1,
             orderType: 0,
-            price: uint256(priceBps),
+            price: priceBps,
             amount: fillAmount,
-            nonce: nonce,
+            maxFee: 0,
+            nonce: ++nonceCounter,
             expiry: block.timestamp + 3600
         });
-        bytes32 digest = s.orderDigest(order);
-        (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(m.privateKey, digest);
-        bytes memory sig = abi.encodePacked(r, sSig, v);
-
-        // Ensure buyer can afford the cash + fees. Set sellerReceives =
-        // cashPart, no fees to keep the fuzz tractable.
-        if (usdt.balanceOf(m.addr) < cashPart) return;
+        UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
+            maker: buyer.addr,
+            market: mid,
+            option: option,
+            side: 0,
+            orderType: 0,
+            price: priceBps,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
+        });
 
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
-            order: order,
-            signature: sig,
-            marketId: mid,
-            option: option,
+            makerOrder: makerOrder,
+            makerSignature: _sign(seller, makerOrder),
+            takerOrder: takerOrder,
+            takerSignature: _sign(buyer, takerOrder),
             fillAmount: fillAmount,
-            taker: taker,
-            sellerReceives: cashPart,
             platformFee: 0,
-            makerFee: 0,
-            makerFeeRecipient: address(0)
+            makerFee: 0
         });
         vm.prank(relayer);
         s.enterPosition(f);
     }
 
+    // ── MINT match: two BUYers on opposite options, priced so p_up + p_down >= 10000. ──
+    function fuzzMintMatch(uint256 marketIdx, uint256 aIdx, uint256 bIdx, uint16 upPriceBps, uint256 fillAmount)
+        external
+    {
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory upBuyer = wallets[aIdx % wallets.length];
+        Vm.Wallet memory downBuyer = wallets[bIdx % wallets.length];
+        if (upBuyer.addr == downBuyer.addr) return;
+
+        uint256 pUp = bound(uint256(upPriceBps), 1, 9999);
+        uint256 pDown = 10000 - pUp; // crossing at the boundary (sum == 10000)
+        fillAmount = bound(fillAmount, 1, 1_000e18);
+        uint256 upCash = (pUp * fillAmount) / 10000;
+        uint256 downCash = fillAmount - upCash;
+        if (usdt.balanceOf(upBuyer.addr) < upCash || usdt.balanceOf(downBuyer.addr) < downCash) return;
+
+        UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
+            maker: upBuyer.addr,
+            market: mid,
+            option: 1,
+            side: 0,
+            orderType: 0,
+            price: pUp,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
+            maker: downBuyer.addr,
+            market: mid,
+            option: 2,
+            side: 0,
+            orderType: 0,
+            price: pDown,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
+            makerOrder: makerOrder,
+            makerSignature: _sign(upBuyer, makerOrder),
+            takerOrder: takerOrder,
+            takerSignature: _sign(downBuyer, takerOrder),
+            fillAmount: fillAmount,
+            platformFee: 0,
+            makerFee: 0
+        });
+        vm.prank(relayer);
+        s.mintMatch(f);
+    }
+
+    // ── MERGE match: two SELLers on opposite options who hold the shares, p_up + p_down <= 10000. ──
+    function fuzzMergeMatch(uint256 marketIdx, uint256 aIdx, uint256 bIdx, uint16 upPriceBps, uint256 fillAmount)
+        external
+    {
+        (uint256 mid, bool ok) = _activeMarket(marketIdx);
+        if (!ok) return;
+        Vm.Wallet memory upSeller = wallets[aIdx % wallets.length];
+        Vm.Wallet memory downSeller = wallets[bIdx % wallets.length];
+        if (upSeller.addr == downSeller.addr) return;
+
+        uint256 upHeld = s.sharesOf(mid, upSeller.addr, 1);
+        uint256 downHeld = s.sharesOf(mid, downSeller.addr, 2);
+        uint256 maxFill = upHeld < downHeld ? upHeld : downHeld;
+        if (maxFill == 0) return;
+        fillAmount = bound(fillAmount, 1, maxFill);
+
+        uint256 pUp = bound(uint256(upPriceBps), 1, 9999);
+        uint256 pDown = 10000 - pUp; // sum == 10000, the crossing boundary for a merge
+
+        UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
+            maker: upSeller.addr,
+            market: mid,
+            option: 1,
+            side: 1,
+            orderType: 0,
+            price: pUp,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.Order memory takerOrder = UpDownSettlement.Order({
+            maker: downSeller.addr,
+            market: mid,
+            option: 2,
+            side: 1,
+            orderType: 0,
+            price: pDown,
+            amount: fillAmount,
+            maxFee: 0,
+            nonce: ++nonceCounter,
+            expiry: block.timestamp + 3600
+        });
+        UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
+            makerOrder: makerOrder,
+            makerSignature: _sign(upSeller, makerOrder),
+            takerOrder: takerOrder,
+            takerSignature: _sign(downSeller, takerOrder),
+            fillAmount: fillAmount,
+            platformFee: 0,
+            makerFee: 0
+        });
+        vm.prank(relayer);
+        s.mergeMatch(f);
+    }
+
     function fuzzResolve(uint256 marketIdx, uint8 winner) external {
         uint256 mid = markets[marketIdx % markets.length];
-        UpDownSettlement.Market memory mkt = s.getMarket(mid);
-        if (mkt.resolved) return;
+        UpDownSettlement.Market memory m = s.getMarket(mid);
+        if (m.resolved) return;
         winner = uint8(bound(uint256(winner), 1, 2));
-        // Need to be past endTime; warp forward enough.
-        if (block.timestamp < uint256(mkt.endTime)) {
-            vm.warp(uint256(mkt.endTime) + 1);
-        }
+        if (block.timestamp < uint256(m.endTime)) vm.warp(uint256(m.endTime) + 1);
         vm.prank(resolver);
         s.resolve(mid, 60_000e8, winner);
     }
 
-    function fuzzWithdraw(uint256 marketIdx) external {
+    function fuzzRedeem(uint256 marketIdx, uint256 walletIdx) external {
         uint256 mid = markets[marketIdx % markets.length];
-        UpDownSettlement.Market memory mkt = s.getMarket(mid);
-        if (!mkt.resolved || mkt.settled) return;
-        vm.prank(relayer);
-        s.withdrawSettlement(mid);
+        UpDownSettlement.Market memory m = s.getMarket(mid);
+        if (!m.resolved) return;
+        Vm.Wallet memory w = wallets[walletIdx % wallets.length];
+        if (s.sharesOf(mid, w.addr, m.winner) == 0) return;
+        vm.prank(w.addr);
+        s.redeem(mid);
+    }
+
+    function _sign(Vm.Wallet memory w, UpDownSettlement.Order memory o) internal returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 ss) = vm.sign(w.privateKey, s.orderDigest(o));
+        return abi.encodePacked(r, ss, v);
     }
 }

@@ -1,7 +1,9 @@
-# Environment
+# Environment — ignore every .env variant, keep the committed *.example templates.
+# Without the wildcard, `.env.dev` / `.env.prod` are NOT ignored and a filled-in
+# file would commit a live private key.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.*.example
 
 # Dependencies
 node_modules/
@@ -23,3 +25,6 @@ broadcast/
 # OS
 .DS_Store
 Thumbs.db
+
+docs/csco-reports/
+audit-repro/

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.29;
+pragma solidity 0.8.29;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IUpDownSettlement} from "./interfaces/IUpDownSettlement.sol";
@@ -11,7 +12,7 @@ import {ChainlinkResolver} from "./ChainlinkResolver.sol";
 /// @notice Chainlink Automation-compatible keeper that auto-creates and auto-resolves
 ///         UpDown prediction markets (e.g. BTC/USD) on 5, 15, and 60-minute cycles.
 ///         Markets are created inside a single `UpDownSettlement` contract (no per-market deploy).
-contract UpDownAutoCycler is Ownable {
+contract UpDownAutoCycler is Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ── Errors ──────────────────────────────────────────────────────────
@@ -43,8 +44,8 @@ contract UpDownAutoCycler is Ownable {
     ///         created on this cycler, or wrong cycler.
     error MarketNotInActiveSet(uint256 marketId);
     /// @notice #21: caller of `evictUnresolved` named a market that is still
-    ///         within the resolver's `MAX_STALENESS` window — i.e. the
-    ///         permissionless `ChainlinkResolver.resolve` call could still
+    ///         within the resolver's `MAX_STALENESS` window — i.e. an
+    ///         authorized `ChainlinkResolver.resolve` call could still
     ///         succeed for this market. Admin eviction is gated to provably
     ///         unresolvable markets to avoid an admin-mistake user-funds-locking
     ///         class of bug. Wait until `endTime + RESOLVER_MAX_STALENESS <
@@ -65,6 +66,11 @@ contract UpDownAutoCycler is Ownable {
     ///         no-op'ing. The replacement-address record from the first
     ///         call stays canonical.
     error AlreadyDeprecated();
+    /// @notice F-2026-17726: `performUpkeep` was called by an address that is neither the registered
+    ///         Automation forwarder nor the owner. The core of the High: a permissionless
+    ///         `performUpkeep` let an attacker spam empty-report slots and fail-forward the pointer
+    ///         arbitrarily far, halting market creation for zero capital.
+    error NotForwarder();
 
     // ── Events ──────────────────────────────────────────────────────────
     event MarketCreated(uint256 indexed marketId, bytes32 indexed pairId, uint256 duration, int256 strikePrice);
@@ -97,6 +103,20 @@ contract UpDownAutoCycler is Ownable {
     ///         consumers (the backend's MarketSyncer) read this to know how
     ///         far ahead of `startTime` markets may now appear.
     event PreStartWindowUpdated(uint256 previous, uint256 current);
+    /// @notice F-2026-17782: emitted when the owner deactivates a pair so it
+    ///         stops receiving new markets each cycle. Inverse of the
+    ///         (event-less) `addPair`.
+    event PairRemoved(bytes32 indexed pairId);
+    /// @notice F-2026-17726: emitted when the owner manually repairs a
+    ///         `pairTfLastCreated` pointer (e.g. after a fail-forward skipped
+    ///         a legitimate slot). Recovery audit trail.
+    event PairTfLastCreatedReset(bytes32 indexed pairId, uint256 indexed tfIdx, uint256 value);
+    /// @notice F-2026-17726: emitted when the owner sets/rotates the Automation forwarder.
+    event ForwarderSet(address indexed previous, address indexed current);
+    /// @notice F-2026-17780: emitted when a `performUpkeep` create slot is a no-op because its
+    ///         `plannedStart` doesn't match the contract's expected next slot (stale/replayed
+    ///         performData). Distinguishes an idempotent skip from a genuine creation failure.
+    event SlotAlreadyProcessed(bytes32 indexed pairId, uint256 indexed tfIdx, uint256 plannedStart);
 
     // ── Types ───────────────────────────────────────────────────────────
     struct TimeframeConfig {
@@ -123,7 +143,7 @@ contract UpDownAutoCycler is Ownable {
     struct CreateSlot {
         bytes32 pairId;
         uint256 tfIdx;
-        uint64 plannedStart;  // pre-computed by checkUpkeep so the coordinator knows the exact slot boundary to fetch a report for
+        uint64 plannedStart; // pre-computed by checkUpkeep so the coordinator knows the exact slot boundary to fetch a report for
         bytes signedReport;
     }
 
@@ -192,6 +212,13 @@ contract UpDownAutoCycler is Ownable {
     ///         `CyclerDeprecated` event for off-chain indexers.
     bool public deprecated;
 
+    /// @notice F-2026-17726: the Chainlink Automation forwarder permitted to call `performUpkeep`
+    ///         (alongside the owner). Set post-deploy via `setForwarder` once the upkeep is
+    ///         registered (the forwarder address only exists after registration). While unset, only
+    ///         the owner can drive the cycler — fail-safe. The stopgap cron drives it from the
+    ///         relayer wallet, so the deploy script seeds `forwarder = relayer`.
+    address public forwarder;
+
     // ── Constructor ─────────────────────────────────────────────────────
     constructor(address _owner, address _resolver, address _settlement) Ownable(_owner) {
         if (_resolver == address(0) || _settlement == address(0)) revert ZeroAddress();
@@ -221,11 +248,7 @@ contract UpDownAutoCycler is Ownable {
     }
 
     /// @notice Same layout as the default getter for a public array of structs.
-    function activeMarkets(uint256 index)
-        external
-        view
-        returns (uint256 marketId, uint256 endTime, bytes32 pairId)
-    {
+    function activeMarkets(uint256 index) external view returns (uint256 marketId, uint256 endTime, bytes32 pairId) {
         ActiveMarket storage m = _activeMarkets[index];
         return (m.marketId, m.endTime, m.pairId);
     }
@@ -306,9 +329,8 @@ contract UpDownAutoCycler is Ownable {
                         // `signedReport` is empty here — coordinator fills it in
                         // before calling performUpkeep.
                         uint256 lastStart = pairTfLastCreated[pid][ti];
-                        uint256 plannedStart = lastStart == 0
-                            ? (block.timestamp / tft.duration) * tft.duration
-                            : lastStart + tft.duration;
+                        uint256 plannedStart =
+                            lastStart == 0 ? (block.timestamp / tft.duration) * tft.duration : lastStart + tft.duration;
                         createSlots[ci++] = CreateSlot({
                             pairId: pid,
                             tfIdx: ti,
@@ -334,54 +356,41 @@ contract UpDownAutoCycler is Ownable {
     ///         `performData` (still emitted by `checkUpkeep`) so a future
     ///         redesign can read it, but `performUpkeep` ignores it today.
     function performUpkeep(bytes calldata performData) external {
-        // F-01: loud revert when deprecated. Pairs with the silent
-        // `checkUpkeep` return — Chainlink Automation should never call
-        // `performUpkeep` on a deprecated cycler (because `checkUpkeep`
-        // returns `false`), but a misconfigured external keeper (the
-        // PR #88 footgun: hardcoded stale cycler address) could still
-        // call `performUpkeep` directly. The revert converts that silent
-        // burn into a loud failure the keeper operator notices.
+        // F-01: loud revert when deprecated.
         if (deprecated) revert Deprecated();
+
+        // F-2026-17726: gate to the Automation forwarder (or owner). This is the core of the High —
+        // a permissionless `performUpkeep` let any attacker submit empty-report slots and fail-forward
+        // `pairTfLastCreated` arbitrarily far for gas only, halting market creation. Restricting the
+        // caller removes the adversarial-input surface entirely; the transient-failure policy and
+        // idempotency below are defense-in-depth for an honest-but-buggy keeper.
+        if (msg.sender != forwarder && msg.sender != owner()) revert NotForwarder();
 
         // `resolveIndices` is decoded for ABI/payload stability with the
         // Chainlink Automation registration but not iterated here because
         // resolution is roundId-bound and lives off-chain.
-        (, CreateSlot[] memory createSlots) =
-            abi.decode(performData, (uint256[], CreateSlot[]));
+        (, CreateSlot[] memory createSlots) = abi.decode(performData, (uint256[], CreateSlot[]));
 
         // Phase B: create new markets (external self-call so try/catch can recover)
         for (uint256 i; i < createSlots.length; ++i) {
             CreateSlot memory slot = createSlots[i];
-            try this._createMarketExternal(slot.tfIdx, slot.pairId, slot.signedReport) {} catch (bytes memory reason) {
-                // F-06 part 2 (fail-forward): advance `pairTfLastCreated` so
-                // the next `checkUpkeep` doesn't re-flag this same failed
-                // slot. The failed slot becomes a permanent gap; the
-                // `MarketCreationFailed` + `SlotSkippedAfterFailure` events
-                // carry pairId + tfIdx + raw revert reason so ops can audit
-                // every gap. Loud-and-permanent beats stuck-and-silent.
-                //
-                // Two callers can land here: the F-02 freshness guard
-                // (catch-up catch-up burns one slot at a time) and any other
-                // revert inside `_createMarket` (strike overflow per F-06
-                // part 1, registerMarket consistency mismatch, an externally
-                // unavailable resolver, etc.). The advancement semantic is
-                // identical: skip this slot, retry the next one.
-                //
-                // Defensive guard on `slot.tfIdx`: `checkUpkeep` only emits
-                // valid tfIdx (< NUM_TIMEFRAMES), but `performUpkeep` is
-                // external — a hand-crafted `performData` could pass an
-                // out-of-range tfIdx that already caused _createMarket to
-                // revert with InvalidTimeframeIndex. In that case, indexing
-                // `timeframes[slot.tfIdx]` below would itself revert,
-                // turning the catch into a second revert. Skip the
-                // advancement for invalid tfIdx — emit the failure event
-                // only.
-                if (slot.tfIdx < NUM_TIMEFRAMES) {
+            // F-2026-17780: thread `slot.plannedStart` so `_createMarket` can validate it against the
+            // expected next slot and no-op on a replayed/duplicate performData.
+            try this._createMarketExternal(slot.tfIdx, slot.pairId, slot.plannedStart, slot.signedReport) {}
+            catch (bytes memory reason) {
+                // F-2026-17726: transient-vs-permanent failure policy. We advance the pointer ONLY on
+                // `PlannedStartTooStale` — the one genuinely-permanent skip, where the slot's window
+                // has irrecoverably passed and creating it is impossible. For every OTHER revert
+                // (a bad/stale/unavailable Streams report, a resolver hiccup, a transient config gap)
+                // we do NOT advance: the next `checkUpkeep` re-flags the same slot and a legitimate
+                // retry with a fresh report creates it. Pre-fix, advancing on ANY revert is exactly
+                // what let the empty-report attack push the pointer forward.
+                bool permanentSkip = _isSelector(reason, PlannedStartTooStale.selector);
+                if (permanentSkip && slot.tfIdx < NUM_TIMEFRAMES) {
                     TimeframeConfig storage tft = timeframes[slot.tfIdx];
                     uint256 lastStart = pairTfLastCreated[slot.pairId][slot.tfIdx];
-                    uint256 skippedSlotStart = lastStart == 0
-                        ? (block.timestamp / tft.duration) * tft.duration
-                        : lastStart + tft.duration;
+                    uint256 skippedSlotStart =
+                        lastStart == 0 ? (block.timestamp / tft.duration) * tft.duration : lastStart + tft.duration;
                     pairTfLastCreated[slot.pairId][slot.tfIdx] = skippedSlotStart;
                     emit SlotSkippedAfterFailure(slot.pairId, slot.tfIdx, skippedSlotStart);
                 }
@@ -392,13 +401,26 @@ contract UpDownAutoCycler is Ownable {
         _pruneResolved();
     }
 
+    /// @dev Extract the 4-byte error selector from raw revert bytes for the transient-vs-permanent
+    ///      classification in `performUpkeep` (F-2026-17726).
+    function _isSelector(bytes memory reason, bytes4 selector) internal pure returns (bool) {
+        if (reason.length < 4) return false;
+        bytes4 got;
+        assembly {
+            got := mload(add(reason, 0x20))
+        }
+        return got == selector;
+    }
+
     /// @dev Callable only via `this` from performUpkeep so failures are catchable.
-    ///      Streams-strike (2026-05-16): now also takes the signed Streams
-    ///      report for strike capture. Passed through to `_createMarket`
-    ///      which hands it to `resolver.captureStrike`.
-    function _createMarketExternal(uint256 tfIdx, bytes32 pairId, bytes memory signedReport) external {
+    ///      Streams-strike (2026-05-16): also takes the signed Streams report for strike capture.
+    ///      F-2026-17780: `plannedStart` from the upkeep payload is threaded through for the
+    ///      idempotency check in `_createMarket`.
+    function _createMarketExternal(uint256 tfIdx, bytes32 pairId, uint64 plannedStart, bytes memory signedReport)
+        external
+    {
         require(msg.sender == address(this), "only cycler");
-        _createMarket(tfIdx, pairId, signedReport);
+        _createMarket(tfIdx, pairId, plannedStart, signedReport);
     }
 
     // ── Internal ────────────────────────────────────────────────────────
@@ -414,7 +436,7 @@ contract UpDownAutoCycler is Ownable {
     ///      from the backend's perspective). The off-chain matching engine
     ///      refuses to match orders on a market whose `startTime` is in
     ///      the future, so trades only land at-or-after the boundary.
-    function _createMarket(uint256 tfIdx, bytes32 pairId, bytes memory signedReport) internal {
+    function _createMarket(uint256 tfIdx, bytes32 pairId, uint64 plannedStartArg, bytes memory signedReport) internal {
         if (tfIdx >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
         if (!supportedPairs[pairId]) revert("pair not supported");
 
@@ -430,6 +452,16 @@ contract UpDownAutoCycler is Ownable {
             // Continuing cycle: next slot follows the previous one exactly.
             plannedStart = lastStart + tf.duration;
         }
+
+        // F-2026-17780: idempotency. The keeper-supplied `plannedStartArg` must equal the slot the
+        // contract is actually expecting. A replayed/duplicate performData carries a stale
+        // `plannedStart` (the slot was already created and the pointer advanced), so this is a clean
+        // no-op — no double-create, and crucially no fail-forward that would skip the next valid slot.
+        if (uint256(plannedStartArg) != plannedStart) {
+            emit SlotAlreadyProcessed(pairId, tfIdx, uint256(plannedStartArg));
+            return;
+        }
+
         uint256 end = plannedStart + tf.duration;
 
         if (end + RESOLVER_MAX_STALENESS < nowTs) {
@@ -488,6 +520,64 @@ contract UpDownAutoCycler is Ownable {
             isCyclingPair[pairId] = true;
             _cyclingPairs.push(pairId);
         }
+    }
+
+    /// @notice F-2026-17782: inverse of `addPair`. Deactivate a pair so it
+    ///         stops receiving new markets and is removed from the cycling
+    ///         list. Both `checkUpkeep` and `_createMarket` gate on
+    ///         `supportedPairs[pairId]`, so flipping it to `false` halts
+    ///         iteration and creation for the pair without deprecating the
+    ///         whole cycler. Existing open markets for the pair are untouched
+    ///         and still resolve normally via the resolver. `isCyclingPair`
+    ///         is also cleared so a later `addPair` re-adds the pair cleanly
+    ///         instead of silently skipping the `_cyclingPairs.push`.
+    function removePair(bytes32 pairId) external onlyOwner {
+        supportedPairs[pairId] = false;
+        if (isCyclingPair[pairId]) {
+            isCyclingPair[pairId] = false;
+            uint256 len = _cyclingPairs.length;
+            for (uint256 i; i < len; ++i) {
+                if (_cyclingPairs[i] == pairId) {
+                    _cyclingPairs[i] = _cyclingPairs[len - 1];
+                    _cyclingPairs.pop();
+                    break;
+                }
+            }
+        }
+        emit PairRemoved(pairId);
+    }
+
+    /// @notice F-2026-17726: owner recovery hatch for a corrupted
+    ///         `pairTfLastCreated` pointer. The permissionless fail-forward in
+    ///         `performUpkeep` can advance the pointer past legitimate slots
+    ///         (e.g. an invalid/empty report makes `captureStrike` revert and
+    ///         the catch block skips the slot). Before this setter the only
+    ///         remedy was `deprecate` + a full bundle redeploy. Setting the
+    ///         pointer back to the last legitimately-created slot's start lets
+    ///         `checkUpkeep` re-schedule the skipped boundaries. Owner-only;
+    ///         does not move funds or touch settlement state.
+    ///
+    ///         NOTE: this is a recovery hatch, not the primary fix for
+    ///         F-2026-17726. The primary fix — restricting `performUpkeep`
+    ///         to the Chainlink Automation `forwarder` (or owner) plus
+    ///         advancing the pointer only on a permanent `PlannedStartTooStale`
+    ///         skip — is now implemented (see `performUpkeep` / `setForwarder`).
+    ///         This hatch is retained as defense-in-depth for an honest-but-
+    ///         stuck pointer.
+    function setPairTfLastCreated(bytes32 pairId, uint256 tfIdx, uint256 value) external onlyOwner {
+        if (tfIdx >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
+        pairTfLastCreated[pairId][tfIdx] = value;
+        emit PairTfLastCreatedReset(pairId, tfIdx, value);
+    }
+
+    /// @notice F-2026-17726: set/rotate the Automation forwarder permitted to call `performUpkeep`.
+    ///         Called post-deploy once the upkeep is registered (the forwarder address only exists
+    ///         after registration). Allowing `address(0)` is intentional — it disables all non-owner
+    ///         upkeep (owner can still drive the cycler), a deliberate kill-switch.
+    function setForwarder(address f) external onlyOwner {
+        address prev = forwarder;
+        forwarder = f;
+        emit ForwarderSet(prev, f);
     }
 
     // F-04 (deep review 2026-05-11): `setResolver` and `setSettlement` removed.
@@ -557,7 +647,7 @@ contract UpDownAutoCycler is Ownable {
     ///         `endTime + RESOLVER_MAX_STALENESS < block.timestamp`. This
     ///         is the same provably-unresolvable condition F-02 uses to
     ///         REFUSE creation. Markets within the staleness window are
-    ///         still resolvable via the permissionless
+    ///         still resolvable via the authorized
     ///         `ChainlinkResolver.resolve` and admin must not be able to
     ///         force-evict them (that would lock user funds in those
     ///         markets — the same hazard F-04 closes for resolver/settlement

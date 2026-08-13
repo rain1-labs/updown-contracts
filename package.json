@@ -1,21 +1,16 @@
 {
   "name": "updown-contracts",
   "version": "1.0.0",
+  "private": true,
+  "description": "Task runner only. No dependencies — this repo is pure Foundry. Do not add hardhat back.",
   "scripts": {
-    "compile": "hardhat compile",
-    "deploy:local": "hardhat run scripts/deploy.js",
-    "deploy:arbitrum": "hardhat run scripts/deploy.js --network arbitrum",
-    "fund:arbitrum": "hardhat run scripts/fund.js --network arbitrum",
-    "post-deploy:arbitrum": "hardhat run scripts/post-deploy.js --network arbitrum",
-    "mint:usdt": "hardhat run scripts/mint-dev-usdt.js --network arbitrum",
-    "node": "hardhat node"
-  },
-  "devDependencies": {
-    "@nomicfoundation/hardhat-ethers": "^3.0.8",
-    "@nomicfoundation/hardhat-foundry": "^1.1.3",
-    "@nomicfoundation/hardhat-verify": "^2.0.0",
-    "dotenv": "^16.4.7",
-    "ethers": "^6.13.5",
-    "hardhat": "^2.22.19"
+    "simulate:dev": "set -a && . ./.env.dev && set +a && DEPLOY_LABEL=dev forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\"",
+    "simulate:prod": "set -a && . ./.env.prod && set +a && DEPLOY_LABEL=prod forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\"",
+    "deploy:dev": "set -a && . ./.env.dev && set +a && [ -n \"$ARBISCAN_API_KEY\" ] || { echo 'ARBISCAN_API_KEY is empty — --verify would fail AFTER broadcasting. Set it or drop --verify.'; exit 1; } && WRITE_DEPLOYMENT_RECORD=1 DEPLOY_LABEL=dev forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --broadcast --verify --retries 10 --delay 20",
+    "deploy:prod": "set -a && . ./.env.prod && set +a && [ -n \"$ARBISCAN_API_KEY\" ] || { echo 'ARBISCAN_API_KEY is empty — --verify would fail AFTER broadcasting. Set it or drop --verify.'; exit 1; } && printf 'PROD deploy: Arbitrum One, REAL USDT, live users. Type yes to continue: ' && read ans && [ \"$ans\" = yes ] && WRITE_DEPLOYMENT_RECORD=1 DEPLOY_LABEL=prod forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --broadcast --verify --retries 10 --delay 20",
+    "verify:dev": "set -a && . ./.env.dev && set +a && DEPLOY_LABEL=dev forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --verify --resume --retries 10 --delay 20",
+    "verify:prod": "set -a && . ./.env.prod && set +a && DEPLOY_LABEL=prod forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --verify --resume --retries 10 --delay 20",
+    "mockdon:dev": "set -a && . ./.env.dev && set +a && forge script script/DeployMockDon.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --broadcast",
+    "fork:test": "FOUNDRY_PROFILE=fork forge test --match-contract ForkTest -vvv"
   }
 }

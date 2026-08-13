@@ -19,15 +19,51 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// path, Settlement deploy is SKIPPED, and after Resolver + AutoCycler
 /// are deployed the script calls `settlement.setResolver(newResolver)` +
 /// `settlement.setAutocycler(newCycler)` from the deployer (owner) to
-/// rewire the existing Settlement's pointers. All historic markets +
-/// ThinWallet allowances against the existing Settlement stay intact.
+/// rewire the existing Settlement's pointers. All historic markets, user
+/// shares, and USDT allowances against the existing Settlement stay intact.
 ///
 /// Required env vars:
 ///   DEPLOYER_PRIVATE_KEY            — the deployer/owner key
 ///   ARBITRUM_RPC_URL                — Arbitrum One RPC
 ///   USDT_ADDRESS                    — USDT token on the target network
-///   RELAYER_ADDRESS                 — relayer wallet that calls enterPosition / withdrawSettlement
+///   RELAYER_ADDRESS                 — relayer wallet that calls enterPosition / mint / redeemFor
 ///   TREASURY_ADDRESS                — treasury EOA that receives platformFee + funds rebate claims
+///   STREAMS_FEED_ID_BTC_USD         — Data Streams feed id for BTC/USD
+///   STREAMS_FEED_ID_ETH_USD         — Data Streams feed id for ETH/USD
+///
+///     Both feed ids are REQUIRED and configured inside the broadcast below.
+///     They used to be a post-deploy manual step, which was a live footgun:
+///     `registerMarket` gates on `priceFeeds[pair] != 0 || streamsFeedId[pair] != 0`
+///     and this script populates `priceFeeds` from the constructor, so the gate
+///     PASSES with no Streams config. The cycler would then happily open markets
+///     and take user collateral while `resolve`/`captureStrike` — which read
+///     `streamsFeedId`, not `priceFeeds` — could never settle them. Since
+///     `redeem` reverts `NotResolved` and `burn` needs a complete set before
+///     `endTime`, that collateral would be permanently locked. Fail fast here
+///     instead: an unset feed id aborts the deploy.
+///
+/// Optional env vars (deploy shape):
+///   PRE_START_WINDOW_SEC            — cycler pre-listing window, default 300.
+///                                     NOTE: the contract default is 0 and the
+///                                     constructor does not set it, but both live
+///                                     deployments run 300 (set by hand post-deploy).
+///                                     Defaulting to 300 here stops a fresh deploy
+///                                     from silently regressing to 0, which would
+///                                     publish markets only at the slot boundary and
+///                                     leave market makers no pre-positioning window.
+///   KEEPER_FORWARDER_ADDRESS        — cycler forwarder, default RELAYER_ADDRESS.
+///                                     Prod drives the keeper from a wallet distinct
+///                                     from the relayer; dev shares one.
+///   OWNER_ADDRESS                   — when set, transfers ownership of all three
+///                                     contracts to it as the last broadcast step.
+///                                     All three are Ownable2Step, so this only sets
+///                                     `pendingOwner` — the target must call
+///                                     `acceptOwnership()` to complete it. No lockout
+///                                     risk if the address is wrong.
+///   DEPLOY_LABEL                    — names the JSON deployment record, e.g. "dev" /
+///                                     "prod". Both environments share chain id 42161,
+///                                     so the record is keyed on this rather than on
+///                                     chainid to stop dev clobbering prod.
 ///
 /// Optional env var (migration mode):
 ///   EXISTING_SETTLEMENT_ADDRESS     — when set, skip Settlement deploy and
@@ -50,14 +86,20 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///                                     Arbitrum One:     0xFdB631F5EE196F0ed6FAa767959853A9F217697D
 ///                                     Arbitrum Sepolia: deploy `MockAggregatorV3(0, 0, 1)` (answer=0, ancient updatedAt).
 contract DeployUpDown is Script {
-
     // ── Pair IDs ────────────────────────────────────────────────────────
     bytes32 constant BTCUSD = keccak256("BTC/USD");
     bytes32 constant ETHUSD = keccak256("ETH/USD");
 
-    // ── Fee defaults (basis points) ─────────────────────────────────────
-    uint256 constant PLATFORM_FEE_BPS = 70;
-    uint256 constant MAKER_FEE_BPS = 80;
+    // ── Rebate budget defaults (F-2026-17779 rolling treasury circuit-breaker) ──
+    // Cap rebate claims to $5,000 / 7-day window by default. Ops tunes via
+    // `setRebateBudget`. A $0 budget would disable rebates entirely (fail-safe),
+    // so the deploy seeds a working non-zero default.
+    uint256 constant REBATE_BUDGET_PER_WINDOW = 5_000_000_000; // 5,000 USDT (6 decimals)
+    uint256 constant REBATE_WINDOW_DURATION = 7 days;
+
+    /// @dev Matches the value live on both dev and prod. Capped at
+    ///      `UpDownAutoCycler.PRE_START_WINDOW_MAX` (300).
+    uint256 constant PRE_START_WINDOW_DEFAULT = 300;
 
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -81,8 +123,18 @@ contract DeployUpDown is Script {
         address ethUsdFeed = vm.envAddress("CHAINLINK_ETH_USD_FEED");
         address sequencerFeed = vm.envAddress("CHAINLINK_SEQUENCER_FEED");
 
+        // Streams feed ids — required; see the header note on why an unset id
+        // must abort rather than defer to a post-deploy checklist.
+        bytes32 btcStreamsFeedId = vm.envBytes32("STREAMS_FEED_ID_BTC_USD");
+        bytes32 ethStreamsFeedId = vm.envBytes32("STREAMS_FEED_ID_ETH_USD");
+
+        uint256 preStartWindowSec = vm.envOr("PRE_START_WINDOW_SEC", PRE_START_WINDOW_DEFAULT);
+        // Defaults to the relayer, preserving the previous behaviour for dev.
+        address keeperForwarder = vm.envOr("KEEPER_FORWARDER_ADDRESS", relayer);
+        address newOwner = vm.envOr("OWNER_ADDRESS", address(0));
+
         // Migration mode: EXISTING_SETTLEMENT_ADDRESS preserves historic
-        // markets + ThinWallet allowances. New deploy when unset.
+        // markets, user shares, and USDT allowances. New deploy when unset.
         address existingSettlement;
         try vm.envAddress("EXISTING_SETTLEMENT_ADDRESS") returns (address a) {
             existingSettlement = a;
@@ -113,7 +165,9 @@ contract DeployUpDown is Script {
             settlement = UpDownSettlement(existingSettlement);
             console.log("UpDownSettlement (existing):", address(settlement));
         } else {
-            settlement = new UpDownSettlement(IERC20(usdt), deployer, PLATFORM_FEE_BPS, MAKER_FEE_BPS);
+            // F-2026-17746: fee bps removed from the constructor — fees are signed-and-capped
+            // per order, not derived from on-chain bps.
+            settlement = new UpDownSettlement(IERC20(usdt), deployer);
             console.log("UpDownSettlement (fresh):", address(settlement));
         }
 
@@ -146,14 +200,45 @@ contract DeployUpDown is Script {
         settlement.setAutocycler(address(cycler));
         settlement.setRelayer(relayer);
         settlement.setTreasury(treasury);
+        // F-2026-17779: seed the rolling rebate budget circuit-breaker.
+        settlement.setRebateBudget(REBATE_BUDGET_PER_WINDOW, REBATE_WINDOW_DURATION);
 
+        // F-2026-17760: the cycler captures strikes; the relayer (resolver service) submits
+        // resolutions. Both must be authorized now that resolve/captureStrike are access-gated.
         resolver.setAuthorizedCaller(address(cycler), true);
+        resolver.setAuthorizedCaller(relayer, true);
+
+        // Bind each pair to its Data Streams feed id. This is what the
+        // strike/resolve lifecycle actually reads — without it the deploy
+        // produces a system that opens markets it can never settle. Done
+        // in-broadcast so a missing env var fails the deploy rather than a
+        // post-deploy checklist item.
+        resolver.configureStreamsFeed(BTCUSD, btcStreamsFeedId);
+        resolver.configureStreamsFeed(ETHUSD, ethStreamsFeedId);
+
+        // F-2026-17726: gate performUpkeep to the keeper. The stopgap cron drives the cycler from
+        // the keeper wallet (== relayer on dev, a separate wallet on prod); once Chainlink
+        // Automation is registered, ops updates this to the Automation forwarder address.
+        cycler.setForwarder(keeperForwarder);
 
         // Whitelist + start cycling both pairs. In migration mode, the
         // NEW cycler has a fresh _cyclingPairs[] state and needs the same
         // whitelist as the orphaned old cycler.
         cycler.addPair(BTCUSD);
         cycler.addPair(ETHUSD);
+
+        // Pre-listing window. Not set by the constructor (defaults to 0), so
+        // this must be explicit or a fresh deploy silently regresses.
+        cycler.setPreStartWindowSec(preStartWindowSec);
+
+        // Ownership handoff LAST — every owner-gated call above must land while
+        // the deployer still holds the role. Ownable2Step: this only sets
+        // `pendingOwner`; the target completes it with `acceptOwnership()`.
+        if (newOwner != address(0) && newOwner != deployer) {
+            settlement.transferOwnership(newOwner);
+            resolver.transferOwnership(newOwner);
+            cycler.transferOwnership(newOwner);
+        }
 
         vm.stopBroadcast();
 
@@ -163,12 +248,61 @@ contract DeployUpDown is Script {
         console.log("  5m slot start (unix):", (ts / 300) * 300);
         console.log("  15m slot start (unix):", (ts / 900) * 900);
         console.log("  60m slot start (unix):", (ts / 3600) * 3600);
-        console.log("(Add ETH/USD to cycling via owner addPair if desired.)");
         console.log("");
         console.log("=== Deployment complete ===");
         console.log("UpDownSettlement:", address(settlement));
         console.log("ChainlinkResolver:", address(resolver));
         console.log("UpDownAutoCycler:", address(cycler));
-        console.log("Next: register UpDownAutoCycler on Chainlink Automation, fund 5-10 LINK, verify on Arbiscan");
+        console.log("Keeper forwarder:", keeperForwarder);
+        console.log("Pre-start window:", preStartWindowSec);
+        console.log("BTC/USD + ETH/USD pairs cycling, Streams feed ids configured.");
+
+        // ── Deployment record ───────────────────────────────────────────────
+        // `broadcast/` is gitignored and console output is not machine-readable,
+        // so emit a JSON artifact the backend can consume and ops can audit
+        // after the fact. Requires the `fs_permissions` entry in foundry.toml.
+        //
+        // Only written when WRITE_DEPLOYMENT_RECORD is set, which the `deploy:*`
+        // npm targets do and `simulate:*` deliberately does not. A dry run
+        // produces a file byte-identical to a real deploy's, so without this
+        // gate the deployments/ directory fills with records for deploys that
+        // never happened — indistinguishable from ones that did.
+        //
+        // NOTE on `block`: on Arbitrum, Solidity's block.number is the L1 block
+        // number, not the Arbitrum block. It is recorded for provenance but
+        // cannot be used to locate the deploy transaction on Arbiscan.
+        string memory label = vm.envOr("DEPLOY_LABEL", string("unlabeled"));
+        if (vm.envOr("WRITE_DEPLOYMENT_RECORD", false)) {
+            string memory obj = "deployment";
+            vm.serializeString(obj, "label", label);
+            vm.serializeUint(obj, "chainId", block.chainid);
+            vm.serializeUint(obj, "l1Block", block.number);
+            vm.serializeAddress(obj, "deployer", deployer);
+            vm.serializeAddress(obj, "settlement", address(settlement));
+            vm.serializeAddress(obj, "resolver", address(resolver));
+            vm.serializeAddress(obj, "autocycler", address(cycler));
+            vm.serializeAddress(obj, "relayer", relayer);
+            vm.serializeAddress(obj, "treasury", treasury);
+            vm.serializeAddress(obj, "keeperForwarder", keeperForwarder);
+            vm.serializeAddress(obj, "usdt", usdt);
+            vm.serializeAddress(obj, "verifierProxy", verifierProxy);
+            string memory record = vm.serializeAddress(obj, "pendingOwner", newOwner);
+            vm.writeJson(record, string.concat("deployments/", label, "-", vm.toString(block.number), ".json"));
+            console.log("Deployment record: deployments/%s-%s.json", label, vm.toString(block.number));
+        } else {
+            console.log("Deployment record: not written (simulation; set WRITE_DEPLOYMENT_RECORD=1 to write)");
+        }
+
+        console.log("");
+        if (newOwner != address(0) && newOwner != deployer) {
+            console.log("Ownership handoff PENDING. From the new owner, run:");
+            console.log("  cast send %s 'acceptOwnership()'", address(settlement));
+            console.log("  cast send %s 'acceptOwnership()'", address(resolver));
+            console.log("  cast send %s 'acceptOwnership()'", address(cycler));
+        } else {
+            console.log("WARNING: owner is still the deployer key. Set OWNER_ADDRESS to hand off.");
+        }
+        console.log("Next: authorize this resolver with Chainlink for the configured stream ids,");
+        console.log("      fund it with LINK if verify fees are non-zero, verify on Arbiscan.");
     }
 }
