@@ -30,7 +30,16 @@
 # Flags:
 #   --yes          skip the confirmation prompts (prod still confirms the deploy)
 #   --skip-deploy  run phases 1-5 only, then stop and print the deploy command
+#   --skip-drain   do NOT wait for open markets — see below
 #   --poll <sec>   drain poll interval (default 60)
+#
+# --skip-drain abandons every open market: after setResolver they can be settled
+# by neither resolver, so any collateral in them is unredeemable until an
+# operator re-registers each one on the new resolver. It is defensible when the
+# open markets are empty — a quiet dev environment — and reckless otherwise, so
+# the flag refuses to run unattended, prints the collateral at stake, requires a
+# typed confirmation when any is found, and emits the recovery commands for
+# every market it strands.
 
 set -euo pipefail
 
@@ -39,12 +48,14 @@ ENVNAME="${1:-}"
 shift || true
 ASSUME_YES=0
 SKIP_DEPLOY=0
+SKIP_DRAIN=0
 POLL=60
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes) ASSUME_YES=1 ;;
     --skip-deploy) SKIP_DEPLOY=1 ;;
+    --skip-drain) SKIP_DRAIN=1 ;;
     --poll) POLL="$2"; shift ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -52,7 +63,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$ENVNAME" != "dev" ] && [ "$ENVNAME" != "prod" ]; then
-  echo "usage: $0 <dev|prod> [--yes] [--skip-deploy] [--poll <sec>]" >&2
+  echo "usage: $0 <dev|prod> [--yes] [--skip-deploy] [--skip-drain] [--poll <sec>]" >&2
   exit 2
 fi
 
@@ -61,14 +72,16 @@ ENVFILE=".env.$ENVNAME"
 [ -f "$ENVFILE" ] || { echo "missing $ENVFILE" >&2; exit 1; }
 
 # ── colours / helpers ───────────────────────────────────────────────────────
-if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
-else B=""; G=""; Y=""; R=""; D=""; N=""; fi
+# NB: single-letter names collide easily with loop vars — RS (reset) is
+# deliberately two characters for that reason.
+if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; RS=$'\033[0m'
+else B=""; G=""; Y=""; R=""; D=""; RS=""; fi
 
-phase () { printf '\n%s══ %s ══%s\n' "$B" "$1" "$N"; }
-ok    () { printf '  %s✓%s %s\n' "$G" "$N" "$1"; }
-info  () { printf '  %s·%s %s\n' "$D" "$N" "$1"; }
-warn  () { printf '  %s!%s %s\n' "$Y" "$N" "$1"; }
-die   () { printf '\n  %s✗ %s%s\n\n' "$R" "$1" "$N"; exit 1; }
+phase () { printf '\n%s══ %s ══%s\n' "$B" "$1" "$RS"; }
+ok    () { printf '  %s✓%s %s\n' "$G" "$RS" "$1"; }
+info  () { printf '  %s·%s %s\n' "$D" "$RS" "$1"; }
+warn  () { printf '  %s!%s %s\n' "$Y" "$RS" "$1"; }
+die   () { printf '\n  %s✗ %s%s\n\n' "$R" "$1" "$RS"; exit 1; }
 
 # macOS ships bash 3.2, so no ${var,,}.
 lc () { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
@@ -77,7 +90,7 @@ lc () { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 # an unanswerable prompt must never be read as consent.
 confirm () {
   [ "$ASSUME_YES" = "1" ] && return 0
-  printf '  %s%s%s [y/N] ' "$B" "$1" "$N"
+  printf '  %s%s%s [y/N] ' "$B" "$1" "$RS"
   a=""
   { read -r a </dev/tty; } 2>/dev/null || read -r a 2>/dev/null || true
   case "$a" in
@@ -148,40 +161,79 @@ else
 fi
 
 # ── 3. drain ────────────────────────────────────────────────────────────────
-phase "3/7  DRAIN"
-while :; do
-  N=$(call "$CYCLER" "activeMarketCount()(uint256)")
-  UNRESOLVED=0; LATEST=0; EXPOSED=0
-  if [ "$N" != "0" ]; then
-    for i in $(seq 0 $((N - 1))); do
-      OUT=$(call "$CYCLER" "activeMarkets(uint256)(uint256,uint256,bytes32)" "$i")
-      MID=$(echo "$OUT" | sed -n 1p)
-      END=$(echo "$OUT" | sed -n 2p | sed 's/ .*//')
-      M=$(call "$SETT" "getMarket(uint256)((bytes32,uint128,uint128,uint64,uint64,uint32,uint8,bool,bool,int128,int128))" "$MID" | sed 's/[()]//g')
-      RES=$(echo "$M" | cut -d, -f8 | tr -d ' ')
-      if [ "$RES" = "false" ]; then
-        UNRESOLVED=$((UNRESOLVED + 1))
-        [ "$END" -gt "$LATEST" ] && LATEST=$END || true
-        UP=$(echo "$M" | cut -d, -f2 | tr -d ' ' | sed 's/\[.*//')
-        DN=$(echo "$M" | cut -d, -f3 | tr -d ' ' | sed 's/\[.*//')
-        [ "$((UP + DN))" -gt 0 ] && EXPOSED=$((EXPOSED + 1)) || true
-      fi
-    done
+# Scan the active set once: how many are unresolved, how much collateral they
+# hold, and (for --skip-drain) the data needed to re-adopt each one later.
+ORPHAN_FILE=/tmp/upgrade-orphans-$ENVNAME.txt
+scan_active () {
+  : >"$ORPHAN_FILE"
+  UNRESOLVED=0; LATEST=0; EXPOSED=0; EXPOSED_TOTAL=0
+  ACTIVE_N=$(call "$CYCLER" "activeMarketCount()(uint256)")
+  [ "$ACTIVE_N" = "0" ] && return 0
+  for i in $(seq 0 $((ACTIVE_N - 1))); do
+    OUT=$(call "$CYCLER" "activeMarkets(uint256)(uint256,uint256,bytes32)" "$i")
+    MID=$(echo "$OUT" | sed -n 1p)
+    END=$(echo "$OUT" | sed -n 2p | sed 's/ .*//')
+    M=$(call "$SETT" "getMarket(uint256)((bytes32,uint128,uint128,uint64,uint64,uint32,uint8,bool,bool,int128,int128))" "$MID" | sed 's/[()]//g')
+    RES=$(echo "$M" | cut -d, -f8 | tr -d ' ')
+    [ "$RES" = "false" ] || continue
+    UNRESOLVED=$((UNRESOLVED + 1))
+    [ "$END" -gt "$LATEST" ] && LATEST=$END || true
+    PAIR=$(echo "$M" | cut -d, -f1 | tr -d ' ')
+    STRIKE=$(echo "$M" | cut -d, -f10 | tr -d ' ' | sed 's/\[.*//')
+    UP=$(echo "$M" | cut -d, -f2 | tr -d ' ' | sed 's/\[.*//')
+    DN=$(echo "$M" | cut -d, -f3 | tr -d ' ' | sed 's/\[.*//')
+    T=$((UP + DN))
+    if [ "$T" -gt 0 ]; then EXPOSED=$((EXPOSED + 1)); EXPOSED_TOTAL=$((EXPOSED_TOTAL + T)); fi
+    echo "$MID $PAIR $STRIKE $T" >>"$ORPHAN_FILE"
+  done
+  return 0
+}
+
+if [ "$SKIP_DRAIN" = "1" ]; then
+  phase "3/7  DRAIN — SKIPPED (--skip-drain)"
+  scan_active
+  if [ "$UNRESOLVED" = "0" ]; then
+    ok "nothing open — the flag changed nothing"
+    SKIP_DRAIN=0   # nothing was stranded, so keep the normal gate
+  else
+    warn "abandoning $UNRESOLVED open market(s); $EXPOSED hold collateral"
+    if [ "$EXPOSED" -gt 0 ]; then
+      printf '  %s!%s total at stake: %s (6dp) — these positions become\n' "$Y" "$RS" "$EXPOSED_TOTAL"
+      printf '      unredeemable until each market is re-registered.\n'
+      while read -r MID PAIR STRIKE T; do
+        [ "$T" -gt 0 ] && printf '        market %-8s notional %s\n' "$MID" "$T"
+      done <"$ORPHAN_FILE"
+      # Real value is on the line: never let --yes alone carry this.
+      printf '\n  %sType ORPHAN to strand the collateral above:%s ' "$B" "$RS"
+      typed=""
+      { read -r typed </dev/tty; } 2>/dev/null || read -r typed 2>/dev/null || true
+      [ "$typed" = "ORPHAN" ] || die "not confirmed — drop --skip-drain and let it settle"
+    else
+      ok "none hold collateral — nothing becomes unredeemable"
+      confirm "proceed without draining?"
+    fi
   fi
-  [ "$UNRESOLVED" = "0" ] && { ok "all markets settled"; break; }
-  NOW=$(date +%s)
-  REMAIN=$(( LATEST > NOW ? (LATEST - NOW) : 0 ))
-  info "$UNRESOLVED unresolved ($EXPOSED holding collateral) — last endTime in ${REMAIN}s; polling every ${POLL}s"
-  [ "$REMAIN" = "0" ] && warn "past every endTime but still unresolved — is the resolver service running?" || true
-  sleep "$POLL"
-done
+else
+  phase "3/7  DRAIN"
+  while :; do
+    scan_active
+    [ "$UNRESOLVED" = "0" ] && { ok "all markets settled"; break; }
+    NOW=$(date +%s)
+    REMAIN=$(( LATEST > NOW ? (LATEST - NOW) : 0 ))
+    info "$UNRESOLVED unresolved ($EXPOSED holding collateral) — last endTime in ${REMAIN}s; polling every ${POLL}s"
+    [ "$REMAIN" = "0" ] && warn "past every endTime but still unresolved — is the resolver service running?" || true
+    sleep "$POLL"
+  done
+fi
 
 # ── 4. prune ────────────────────────────────────────────────────────────────
 phase "4/7  PRUNE"
 # With every pair removed, createCount is 0, so upkeepNeeded is false and
 # performUpkeep never fires again — and _pruneResolved only runs inside it.
 # Without this call activeMarketCount stays put and tells you nothing.
-if [ "$(call "$CYCLER" "activeMarketCount()(uint256)")" = "0" ]; then
+if [ "$SKIP_DRAIN" = "1" ]; then
+  ok "skipped — the active set is being abandoned, not tidied"
+elif [ "$(call "$CYCLER" "activeMarketCount()(uint256)")" = "0" ]; then
   ok "active set already empty"
 else
   confirm "send pruneResolved()?"
@@ -192,6 +244,12 @@ fi
 
 # ── 5. gate ─────────────────────────────────────────────────────────────────
 phase "5/7  PREFLIGHT GATE"
+if [ "$SKIP_DRAIN" = "1" ]; then
+  # Only the drain findings are downgraded. Ownership, stream-id schema and
+  # Chainlink wiring stay blocking — those have nothing to do with draining.
+  export PREFLIGHT_ALLOW_UNRESOLVED=true
+  warn "drain findings downgraded to warnings; every other check still blocks"
+fi
 if npm run --silent "preflight:$ENVNAME" >/tmp/upgrade-preflight-2.log 2>&1; then
   ok "GO"
 else
@@ -233,6 +291,22 @@ for v in BTC ETH; do
 done
 
 ok "cycling pairs: $(call "$NEW_CYCLER" "cyclingPairCount()(uint256)")"
+
+if [ "$SKIP_DRAIN" = "1" ] && [ -s "$ORPHAN_FILE" ]; then
+  phase "ORPHANED MARKETS — RECOVERY"
+  echo "  These were open when Settlement was repointed, so neither resolver can"
+  echo "  settle them. Re-adopt any you care about on the new resolver — the call"
+  echo "  validates against Settlement's own record, so it cannot invent a market:"
+  echo ""
+  while read -r MID PAIR STRIKE T; do
+    printf '    # market %s  notional %s\n' "$MID" "$T"
+    printf '    cast send %s \\\n      "registerMarket(uint256,address,bytes32,int256)" \\\n      %s %s %s %s \\\n      --rpc-url "$ARBITRUM_RPC_URL" --private-key "$DEPLOYER_PRIVATE_KEY"\n\n' \
+      "$NEW_RESOLVER" "$MID" "$SETT" "$PAIR" "$STRIKE"
+  done <"$ORPHAN_FILE"
+  echo "  Then resolve each with a report observed at its endTime. Streams reports"
+  echo "  stay verifiable ~30 days, so this is not urgent, but it is manual."
+  echo "  Full list: $ORPHAN_FILE"
+fi
 
 phase "DONE — REMAINING WORK IS OFF-CHAIN"
 cat <<EOF

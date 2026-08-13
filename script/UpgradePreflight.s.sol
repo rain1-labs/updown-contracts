@@ -142,12 +142,32 @@ contract UpgradePreflight is Script {
     ///      directly whether each market resolved — `activeMarketCount` alone is not
     ///      evidence, because `_pruneResolved` only runs inside `performUpkeep`, which
     ///      stops firing once every pair is removed.
+    ///
+    ///      `PREFLIGHT_ALLOW_UNRESOLVED=1` downgrades the drain findings to warnings.
+    ///      That is deliberately an explicit opt-in rather than a flag someone can
+    ///      pass by habit: it is only defensible when the open markets hold no
+    ///      collateral (a quiet dev environment), and the collateral figures printed
+    ///      below are what makes that judgement possible rather than assumed. Every
+    ///      other check stays blocking regardless.
     function _checkDrain(UpDownSettlement settlement, UpDownAutoCycler oldCycler) internal {
+        bool allowUnresolved;
+        try vm.envBool("PREFLIGHT_ALLOW_UNRESOLVED") returns (bool b) {
+            allowUnresolved = b;
+        } catch {
+            allowUnresolved = false;
+        }
+
         console.log("-- Drain (the orphaning gate) --");
+        if (allowUnresolved) {
+            console.log("  [NOTE]   PREFLIGHT_ALLOW_UNRESOLVED=1 -- drain findings are warnings, not blockers");
+        }
 
         uint256 cycling = oldCycler.cyclingPairCount();
         if (cycling == 0) {
             pass("old cycler has no cycling pairs -- no new markets being created");
+        } else if (allowUnresolved) {
+            warn("old cycler is still cycling pairs -- it will keep creating markets against a Settlement that no longer accepts it");
+            console.log("           cyclingPairCount() =", cycling);
         } else {
             fail("old cycler is STILL CYCLING pairs -- call removePair for each first");
             console.log("           cyclingPairCount() =", cycling);
@@ -173,6 +193,16 @@ contract UpgradePreflight is Script {
             pass("every market in the active set has resolved -- nothing to orphan");
             if (n > 0) {
                 warn("active set is non-empty but fully resolved -- call pruneResolved() to tidy");
+            }
+        } else if (allowUnresolved) {
+            warn("UNRESOLVED markets will be orphaned by setResolver -- proceeding anyway");
+            console.log("           unresolved:", unresolved, "of which carrying collateral:", exposed);
+            if (exposed > 0) {
+                warn("ORPHANING COLLATERAL -- those positions become unredeemable until an");
+                console.log("           operator re-registers each market on the new resolver via");
+                console.log("           registerMarket(marketId, settlement, pairId, strikePrice).");
+            } else {
+                console.log("           None carry collateral, so nothing becomes unredeemable.");
             }
         } else {
             fail("UNRESOLVED markets would be orphaned by setResolver");
