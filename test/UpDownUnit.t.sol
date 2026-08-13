@@ -101,7 +101,7 @@ contract MockAggregatorV3 {
 // Chainlink contracts on mainnet are far more elaborate; we trust them
 // operationally and don't try to replicate them in unit tests.
 
-import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV3} from "../src/interfaces/IVerifierProxy.sol";
+import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV2, ReportV3} from "../src/interfaces/IVerifierProxy.sol";
 
 /// @notice Mock LINK token — minimal ERC20 with mintable balance for
 ///         topup tests + a free-form `transfer` for verify-fee payments.
@@ -179,16 +179,27 @@ contract MockVerifierProxy is IVerifierProxy {
     address public s_feeManager;
     ReportV3 public nextReport;
 
+    /// @dev TWAP swap (2026-08-13): raw-bytes override. When set, `verify` echoes
+    ///      these bytes verbatim instead of encoding `nextReport`. Lets tests stage
+    ///      a v2 report (7 words) or a deliberately malformed length, neither of
+    ///      which the `ReportV3` storage slot can express.
+    bytes public nextRaw;
+
     function setFeeManager(address fm) external {
         s_feeManager = fm;
     }
 
     function setNextReport(ReportV3 calldata r) external {
         nextReport = r;
+        delete nextRaw;
+    }
+
+    function setNextRawReport(bytes calldata raw) external {
+        nextRaw = raw;
     }
 
     function verify(bytes calldata, bytes calldata) external payable returns (bytes memory verifierResponse) {
-        verifierResponse = abi.encode(nextReport);
+        verifierResponse = nextRaw.length > 0 ? nextRaw : abi.encode(nextReport);
     }
 }
 
@@ -373,8 +384,24 @@ contract UpDownUnit is Test {
         cycler.harnessCreateMarket(tfIdx, pairId);
     }
 
+    /// @dev TWAP swap (2026-08-13): test stream ids now carry a real schema prefix.
+    ///      Chainlink encodes the report schema in the leading two bytes of a stream
+    ///      id, and `configureStreamsFeed` validates it, so a bare `keccak256` no
+    ///      longer configures — its random prefix decodes as an unsupported schema.
+    ///      Keeping the ids realistically shaped also means these tests exercise the
+    ///      same dispatch path production takes.
+    function _feedIdWithSchema(uint16 schema, bytes32 seed) internal pure returns (bytes32) {
+        return bytes32((uint256(schema) << 240) | (uint256(seed) >> 16));
+    }
+
     function _btcStreamsFeedId() internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked("BTC/USD-streams-test-feed-id"));
+        return _feedIdWithSchema(3, keccak256(abi.encodePacked("BTC/USD-streams-test-feed-id")));
+    }
+
+    /// @dev Fixed v3-schema id used by the resolve-path tests. Replaces the former
+    ///      bare `0xBEEFBEEFBEEFBEEF`, whose `0x0000` prefix is not a valid schema.
+    function _v3TestFeedId() internal pure returns (bytes32) {
+        return _feedIdWithSchema(3, bytes32(uint256(0xBEEF_BEEF_BEEF_BEEF)));
     }
 
     function test_performUpkeepPrunesResolved() public {
@@ -1366,7 +1393,7 @@ contract UpDownUnit is Test {
         st.setAutocycler(address(this));
         // Configure the Streams feed-id for BTC/USD. Use a fixture id; in
         // production this comes from Chainlink's stream-address table.
-        r.configureStreamsFeed(BTCUSD, bytes32(uint256(0xBEEFBEEFBEEFBEEF)));
+        r.configureStreamsFeed(BTCUSD, _v3TestFeedId());
         // Fund the resolver with LINK so verify-fee payment succeeds.
         link.mint(address(r), 100e18); // 100 LINK
     }
@@ -1386,7 +1413,7 @@ contract UpDownUnit is Test {
     ///      will accept. Tests mutate specific fields to drive each
     ///      reject path.
     function _baseReport(uint256 marketEndTime) internal pure returns (ReportV3 memory r) {
-        r.feedId = bytes32(uint256(0xBEEFBEEFBEEFBEEF));
+        r.feedId = _v3TestFeedId();
         r.validFromTimestamp = uint32(marketEndTime - 5);
         r.observationsTimestamp = uint32(marketEndTime);
         r.nativeFee = 0;
@@ -1402,6 +1429,188 @@ contract UpDownUnit is Test {
         mid = st.createMarket(BTCUSD, 300, 50_000e8); // endTime = startedAt + 300
         endTs = startedAt + 300;
         vm.warp(endTs + 1); // step past endTime
+    }
+
+    // ── TWAP swap (2026-08-13): schema-v2 report support ────────────────────
+    //
+    // Chainlink's TWAP streams (`BTC / USD - TWAP: 30s`) publish under report
+    // schema v2, not v3 — a time-weighted average has no order book behind it, so
+    // there is no simulated bid/ask to report. v2 is byte-identical to v3 for its
+    // first seven fields and simply stops there: 224 bytes against v3's 288.
+    //
+    // Pre-fix the resolver hardcoded `abi.decode(..., (ReportV3))`, so configuring a
+    // v2 stream id was accepted silently and then reverted inside every
+    // `captureStrike` / `resolve` — halting the pair with no on-chain signal that the
+    // configuration was the cause. These tests pin both halves of the fix: the decode
+    // now dispatches on the stream id's schema prefix, and `configureStreamsFeed`
+    // rejects a prefix it could never decode.
+
+    function _v2TestFeedId() internal pure returns (bytes32) {
+        return _feedIdWithSchema(2, bytes32(uint256(0xBEEF_BEEF_BEEF_BEEF)));
+    }
+
+    /// @dev Build a v2 report and ABI-encode it exactly as the Verifier Proxy would.
+    function _baseReportV2(uint256 obsTs, bytes32 feedId, int192 price) internal pure returns (bytes memory) {
+        ReportV2 memory r;
+        r.feedId = feedId;
+        r.validFromTimestamp = uint32(obsTs - 5);
+        r.observationsTimestamp = uint32(obsTs);
+        r.nativeFee = 0;
+        r.linkFee = 1e17;
+        r.expiresAt = uint32(obsTs + 1 days);
+        r.price = price;
+        return abi.encode(r);
+    }
+
+    function test_v2_encodesTo224Bytes_v3To288() public pure {
+        ReportV2 memory v2;
+        ReportV3 memory v3;
+        assertEq(abi.encode(v2).length, 224, "v2 ABI-encodes to 7 words");
+        assertEq(abi.encode(v3).length, 288, "v3 ABI-encodes to 9 words");
+    }
+
+    function test_v2_resolve_happyPath_decodesPrice() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        vm.prank(owner);
+        r.configureStreamsFeed(BTCUSD, _v2TestFeedId());
+
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+        verifierProxy.setNextRawReport(_baseReportV2(endTs, _v2TestFeedId(), 60_000e8));
+
+        r.resolve(mid, _fakeSignedReport());
+
+        (,,, bool resolved) = r.markets(mid);
+        assertTrue(resolved, "v2 report resolves the market");
+        assertEq(int256(st.getMarket(mid).settlementPrice), 60_000e8, "settlement price read from ReportV2.price");
+        assertEq(st.getMarket(mid).winner, 1, "60k > 50k strike means UP wins");
+    }
+
+    function test_v2_captureStrike_happyPath_decodesPrice() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        vm.prank(owner);
+        r.configureStreamsFeed(BTCUSD, _v2TestFeedId());
+
+        uint64 startTime = uint64((block.timestamp / 300) * 300 + 300);
+        vm.warp(uint256(startTime));
+        verifierProxy.setNextRawReport(_baseReportV2(uint256(startTime), _v2TestFeedId(), 55_000e8));
+
+        int256 strike = r.captureStrike(BTCUSD, _fakeSignedReport(), startTime);
+
+        assertEq(strike, 55_000e8, "strike read from ReportV2.price");
+        assertEq(r.capturedStrike(BTCUSD, startTime), 55_000e8, "strike cached under (pairId, startTime)");
+        assertTrue(r.strikeCaptured(BTCUSD, startTime), "capture flag set");
+    }
+
+    /// @dev The feedId binding still holds on the v2 path — a report for a different
+    ///      stream is rejected even though it decodes cleanly.
+    function test_v2_resolve_revertsOnFeedIdMismatch() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        vm.prank(owner);
+        r.configureStreamsFeed(BTCUSD, _v2TestFeedId());
+
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+
+        bytes32 wrongFeed = _feedIdWithSchema(2, bytes32(uint256(0xDEAD)));
+        verifierProxy.setNextRawReport(_baseReportV2(endTs, wrongFeed, 60_000e8));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ChainlinkResolver.ReportFeedIdMismatch.selector, _v2TestFeedId(), wrongFeed)
+        );
+        r.resolve(mid, _fakeSignedReport());
+    }
+
+    /// @dev A v2-advertised stream returning a v3-shaped blob (or vice versa) is a
+    ///      DON-side inconsistency, and must fail loudly rather than decode garbage.
+    function test_v2_resolve_revertsWhenLengthDisagreesWithSchema() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+        vm.prank(owner);
+        r.configureStreamsFeed(BTCUSD, _v2TestFeedId());
+
+        (uint256 mid, uint256 endTs) = _createAndExpireMarket(st);
+        r.registerMarket(mid, address(st), BTCUSD, 50_000e8);
+
+        // Stage a 288-byte v3 blob against a v2-configured pair.
+        ReportV3 memory v3 = _baseReport(endTs);
+        v3.feedId = _v2TestFeedId();
+        verifierProxy.setNextRawReport(abi.encode(v3));
+
+        vm.expectRevert(abi.encodeWithSelector(ChainlinkResolver.UnexpectedReportLength.selector, 288));
+        r.resolve(mid, _fakeSignedReport());
+    }
+
+    /// @dev Schema is resolved per-pair from `streamsFeedId[pairId]`, not globally, so
+    ///      one resolver can serve a v2 pair and a v3 pair at the same time. That is
+    ///      what makes a staged rollout possible: move BTC to the TWAP (v2) stream,
+    ///      watch it settle, and leave ETH on v3 spot until you are satisfied — rather
+    ///      than cutting both pairs over in the same transaction pair.
+    /// @dev Timestamps are fixed literals rather than derived from `block.timestamp`.
+    ///      With `via_ir = true`, threading a computed `endTs` local through both report
+    ///      builders in one frame miscompiles here — the second builder panics on
+    ///      `obsTs - 5` despite `obsTs` logging as 1700000300. Passing the same value as
+    ///      a literal compiles correctly, so the schedule is pinned instead. The
+    ///      behaviour under test is unaffected; only the codegen path changes.
+    function test_mixedSchemas_v2AndV3PairsCoexistOnOneResolver() public {
+        (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
+
+        // BTC keeps the v3 id the deploy helper set; ETH gets a v2 id.
+        bytes32 ethUsd = keccak256("ETH/USD");
+        r.configureStreamsFeed(ethUsd, _v2TestFeedId());
+        assertEq(r.streamsFeedId(BTCUSD), _v3TestFeedId(), "BTC configured v3");
+        assertEq(r.streamsFeedId(ethUsd), _v2TestFeedId(), "ETH configured v2");
+
+        vm.warp(1_700_000_000);
+        uint256 btcMid = st.createMarket(BTCUSD, 300, 50_000e8);
+        uint256 ethMid = st.createMarket(ethUsd, 300, 50_000e8);
+        vm.warp(1_700_000_301); // one second past both endTimes
+
+        r.registerMarket(btcMid, address(st), BTCUSD, 50_000e8);
+        r.registerMarket(ethMid, address(st), ethUsd, 50_000e8);
+
+        // v3 pair: 9-word report, 60k against a 50k strike -> UP.
+        verifierProxy.setNextReport(_baseReport(1_700_000_300));
+        r.resolve(btcMid, _fakeSignedReport());
+
+        // v2 pair: 7-word report, 40k against a 50k strike -> DOWN. Same resolver,
+        // same block, different schema — the dispatch is per-pair.
+        verifierProxy.setNextRawReport(_baseReportV2(1_700_000_300, _v2TestFeedId(), 40_000e8));
+        r.resolve(ethMid, _fakeSignedReport());
+
+        assertEq(int256(st.getMarket(btcMid).settlementPrice), 60_000e8, "v3 pair priced from ReportV3");
+        assertEq(st.getMarket(btcMid).winner, 1, "60k > 50k strike means UP");
+        assertEq(int256(st.getMarket(ethMid).settlementPrice), 40_000e8, "v2 pair priced from ReportV2");
+        assertEq(st.getMarket(ethMid).winner, 2, "40k < 50k strike means DOWN");
+    }
+
+    function test_configureStreamsFeed_rejectsUnsupportedSchemaPrefix() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+
+        // 0x0008… is the RWA schema — a real Chainlink prefix, but not one this
+        // resolver can decode. Rejected at configuration time, not at resolve time.
+        bytes32 rwaFeed = _feedIdWithSchema(8, bytes32(uint256(0xABCD)));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(ChainlinkResolver.UnsupportedReportSchema.selector, rwaFeed, 8));
+        r.configureStreamsFeed(BTCUSD, rwaFeed);
+
+        // A bare keccak id — the shape the tests used before this change — has a
+        // meaningless prefix and is rejected the same way.
+        bytes32 unprefixed = keccak256("not-a-real-stream-id");
+        uint16 badSchema = uint16(bytes2(unprefixed));
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(ChainlinkResolver.UnsupportedReportSchema.selector, unprefixed, badSchema)
+        );
+        r.configureStreamsFeed(BTCUSD, unprefixed);
+    }
+
+    /// @dev `bytes32(0)` is the "unset" sentinel that `registerMarket` and
+    ///      `StreamsFeedNotConfigured` both key off, so clearing must stay possible.
+    function test_configureStreamsFeed_allowsZeroToClear() public {
+        (ChainlinkResolver r,) = _deployStreamsResolverSystem();
+        vm.prank(owner);
+        r.configureStreamsFeed(BTCUSD, bytes32(0));
+        assertEq(r.streamsFeedId(BTCUSD), bytes32(0), "zero clears the configured stream");
     }
 
     function test_streams_resolve_happyPath_picksReportPrice() public {
@@ -1428,9 +1637,7 @@ contract UpDownUnit is Test {
         verifierProxy.setNextReport(rep);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                ChainlinkResolver.ReportFeedIdMismatch.selector, bytes32(uint256(0xBEEFBEEFBEEFBEEF)), wrongFeed
-            )
+            abi.encodeWithSelector(ChainlinkResolver.ReportFeedIdMismatch.selector, _v3TestFeedId(), wrongFeed)
         );
         r.resolve(mid, _fakeSignedReport());
     }
@@ -1543,7 +1750,7 @@ contract UpDownUnit is Test {
     function test_streams_registerMarket_streamsOnlyPair_succeeds() public {
         (ChainlinkResolver r, UpDownSettlement st) = _deployStreamsResolverSystem();
         bytes32 solUsd = keccak256("SOL/USD"); // no priceFeeds entry — Streams-only
-        r.configureStreamsFeed(solUsd, bytes32(uint256(0xC0FFEE)));
+        r.configureStreamsFeed(solUsd, _feedIdWithSchema(3, bytes32(uint256(0xC0FFEE))));
 
         uint256 mid = st.createMarket(solUsd, 300, 100e8);
         // Must NOT revert FeedNotConfigured now that the streams feed-id is set.

@@ -29,8 +29,8 @@ contract MockDonE2ETest is Test {
     bytes32 constant BTCUSD = keccak256("BTC/USD");
     bytes32 constant ETHUSD = keccak256("ETH/USD");
     // The demo's actual mock stream ids (keccak256("UPDOWN.MOCK.<pair>")).
-    bytes32 constant FEED_BTC = keccak256("UPDOWN.MOCK.BTC/USD");
-    bytes32 constant FEED_ETH = keccak256("UPDOWN.MOCK.ETH/USD");
+    bytes32 constant FEED_BTC = bytes32((uint256(3) << 240) | (uint256(keccak256("UPDOWN.MOCK.BTC/USD")) >> 16));
+    bytes32 constant FEED_ETH = bytes32((uint256(3) << 240) | (uint256(keccak256("UPDOWN.MOCK.ETH/USD")) >> 16));
 
     // 18-decimal atomic scale (real Crypto Streams scale; backend
     // STRIKE_DECIMALS_FOR_NEW_MARKETS defaults to 18 to match).
