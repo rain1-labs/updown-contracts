@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // fetch_streams_report.mjs — fetch a single signed Chainlink Data Streams
-// `ReportV3` blob from the REST API, for two consumers:
+// report blob (schema v2 or v3) from the REST API, for two consumers:
 //
 //   1. UpDownForkTest.t.sol (Gate 3 real-DON fork test) via `vm.ffi`. In that
 //      mode it prints ONE line: the `0x`-hex `fullReport` blob, which forge
@@ -28,7 +28,8 @@
 //   CHAINLINK_STREAMS_API_KEY    | STREAMS_API_KEY       (required)
 //   CHAINLINK_STREAMS_API_SECRET | STREAMS_API_SECRET    (required)
 //   CHAINLINK_STREAMS_API_BASE_URL | STREAMS_API_BASE_URL
-//       (default https://api.testnet-dataengine.chain.link)
+//       (default https://api.dataengine.chain.link — MAINNET; testnet callers
+//        must set this explicitly, see DEFAULT_BASE below)
 //
 // Usage:
 //   node script/fetch_streams_report.mjs <feedId> <timestamp|latest|prev>
@@ -40,7 +41,15 @@
 
 import { createHash, createHmac } from 'node:crypto';
 
-const DEFAULT_BASE = 'https://api.testnet-dataengine.chain.link';
+// Mainnet, matching what the production backend actually runs against
+// (`updown-backend/src/environments/production.ts#chainlinkStreamsApiBaseUrl`).
+// This used to default to testnet, which was harmless while the only consumer
+// was the Arbitrum Sepolia fork test, but silently pointed every mainnet
+// lookup — including the TWAP streams, which are mainnet-only — at a host that
+// does not serve them. The resulting 4xx reads like a missing entitlement.
+// Testnet callers (the Gate-3 fork test) must now export STREAMS_API_BASE_URL
+// explicitly; its docstring already instructs that.
+const DEFAULT_BASE = 'https://api.dataengine.chain.link';
 const ALIGN = 300; // smallest UpDown timeframe / STRIKE_ALIGNMENT
 
 function env(...names) {
@@ -70,7 +79,7 @@ function buildAuthHeaders(apiKey, apiSecret, method, pathAndQuery, body) {
 // ── Minimal, dependency-free ABI reader for the fullReport envelope ──────────
 // fullReport = abi.encode(bytes32[3] ctx, bytes reportData, bytes32[] rs,
 //                         bytes32[] ss, bytes32 rawVs)
-// reportData = abi.encode(ReportV3) — 9 static words, inline.
+// reportData = abi.encode(ReportV2 | ReportV3) — 7 or 9 static words, inline.
 function hexToBytes(hex) {
   const h = hex.startsWith('0x') ? hex.slice(2) : hex;
   return Buffer.from(h, 'hex');
@@ -85,7 +94,24 @@ function asInt(u, bits) {
   const v = u & mask;
   return v >= 1n << BigInt(bits - 1) ? v - (1n << BigInt(bits)) : v;
 }
-function decodeReportV3(fullReportHex) {
+// Schema dispatch mirrors `ChainlinkResolver._verifyReport`: the stream id's
+// leading two bytes select the layout, and the report's own length is
+// cross-checked against it. v2 (what the TWAP streams publish) is v3 minus the
+// trailing bid/ask pair — 7 words (224 bytes) against v3's 9 (288). Before
+// this, the decode was hardcoded to v3, so a v2 report read two words past the
+// end of `reportData` and printed whatever followed as bid/ask. Same bug class
+// the resolver fixed on-chain in 44c04b2; it survived here because the
+// operator path had no test.
+const SCHEMA_V2 = 2;
+const SCHEMA_V3 = 3;
+const REPORT_WORDS = { [SCHEMA_V2]: 7, [SCHEMA_V3]: 9 };
+
+function schemaOf(feedIdHex) {
+  const h = feedIdHex.startsWith('0x') ? feedIdHex.slice(2) : feedIdHex;
+  return parseInt(h.slice(0, 4), 16);
+}
+
+function decodeReport(fullReportHex) {
   const buf = hexToBytes(fullReportHex);
   // head: [ctx0, ctx1, ctx2, reportDataOffset, rsOffset, ssOffset, rawVs]
   const reportDataOffset = Number(wordBig(buf, 3)); // bytes from start of blob
@@ -93,8 +119,20 @@ function decodeReportV3(fullReportHex) {
   const rdStart = reportDataOffset + 32;
   const rd = buf.subarray(rdStart, rdStart + len);
   const w = (i) => BigInt('0x' + rd.subarray(i * 32, i * 32 + 32).toString('hex'));
-  return {
-    feedId: '0x' + rd.subarray(0, 32).toString('hex'),
+
+  const feedId = '0x' + rd.subarray(0, 32).toString('hex');
+  const schema = schemaOf(feedId);
+  const wantWords = REPORT_WORDS[schema];
+  if (!wantWords) {
+    die(`unsupported report schema v${schema} for feedId ${feedId} — only v2/v3 decode here, matching the resolver`);
+  }
+  if (len !== wantWords * 32) {
+    die(`reportData is ${len} bytes but schema v${schema} expects ${wantWords * 32} — report shape disagrees with its own stream id`);
+  }
+
+  const r = {
+    schema,
+    feedId,
     // validFromTimestamp/observationsTimestamp/expiresAt are uint32 — plain
     // low-4-byte reads (no sign handling).
     validFromTimestamp: Number(w(1) & 0xffffffffn),
@@ -103,9 +141,13 @@ function decodeReportV3(fullReportHex) {
     linkFee: w(4) & ((1n << 192n) - 1n),
     expiresAt: Number(w(5) & 0xffffffffn),
     price: asInt(w(6), 192),
-    bid: asInt(w(7), 192),
-    ask: asInt(w(8), 192),
   };
+  // v2 is a time-weighted average — no order book behind it, so no bid/ask.
+  if (schema === SCHEMA_V3) {
+    r.bid = asInt(w(7), 192);
+    r.ask = asInt(w(8), 192);
+  }
+  return r;
 }
 
 function fmt18(x) {
@@ -168,15 +210,15 @@ async function main() {
     return;
   }
 
-  const r = decodeReportV3(full);
+  const r = decodeReport(full);
   const LINK = fmt18(r.linkFee);
   const out = {
     base,
+    schema: `v${r.schema}`,
     feedId: r.feedId,
     price_1e18: r.price.toString(),
     price_human: fmt18(r.price),
-    bid_human: fmt18(r.bid),
-    ask_human: fmt18(r.ask),
+    ...(r.schema === SCHEMA_V3 ? { bid_human: fmt18(r.bid), ask_human: fmt18(r.ask) } : {}),
     observationsTimestamp: r.observationsTimestamp,
     validFromTimestamp: r.validFromTimestamp,
     expiresAt: r.expiresAt,
