@@ -58,6 +58,12 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///           export ARBITRUM_SEPOLIA_RPC_URL=https://arb-sepolia.g.alchemy.com/v2/<KEY>
 ///           FOUNDRY_PROFILE=fork forge test --match-contract UpDownForkTest -vvv
 ///
+///         The `STREAMS_API_BASE_URL` export above is now REQUIRED, not
+///         belt-and-braces: `fetch_streams_report.mjs` defaults to the MAINNET
+///         data engine (matching the production backend), so without it this
+///         test asks a mainnet host for an Arbitrum Sepolia stream id and gets
+///         a 4xx that reads like missing feed authorization.
+///
 ///         When `ARBITRUM_SEPOLIA_RPC_URL` or the Streams creds are absent
 ///         (e.g. the default CI audit run) every test self-skips via
 ///         `vm.skip(true)`, so the 143-test suite stays green and never
