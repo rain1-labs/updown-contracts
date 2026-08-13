@@ -29,3 +29,58 @@ Public addresses only — no keys, no RPC URLs, no API keys. Safe to commit, and
 committed on purpose: this is the audit trail of which addresses replaced which,
 and the only place the deployer / relayer / treasury / keeper-forwarder set for
 a given deploy is written down.
+
+## A record proves a deploy FINISHED, not that contracts exist
+
+`vm.writeJson` runs at the END of `Deploy.s.sol`. A run that is interrupted
+partway still creates contracts, and — because `setResolver` / `setAutocycler`
+come well before the write — can repoint Settlement at them, without ever
+producing a file here. **This directory is therefore a lower bound on what has
+been deployed, not the full set.**
+
+To enumerate everything a deployer has ever created, derive the CREATE
+addresses from its nonces rather than trusting this directory:
+
+```sh
+N=$(cast nonce "$DEPLOYER" --rpc-url "$ARBITRUM_RPC_URL")
+for n in $(seq 0 $((N-1))); do
+  a=$(cast compute-address "$DEPLOYER" --nonce "$n" --rpc-url "$ARBITRUM_RPC_URL" | awk '{print $NF}')
+  [ "$(cast codesize "$a" --rpc-url "$ARBITRUM_RPC_URL")" != "0" ] && echo "nonce $n -> $a"
+done
+```
+
+### Known unrecorded prod stack (2026-08-13)
+
+| | Address | Deployer nonce |
+|---|---|---|
+| Resolver | `0x589118a9dba1F863BB0579D728b1ac7ce2F6e673` | 34 |
+| AutoCycler | `0x7D4fA2f9d054E4d818b3B83cDe947Facbc06bDA7` | 35 |
+
+Created during the TWAP cutover by a `deploy:prod` run that aborted partway. It
+got as far as creating both contracts and repointing Settlement at the resolver,
+then stopped: `streamsFeedId` is zero for both pairs, `forwarder` is
+`address(0)`, and `cyclingPairCount` is 0 — so it never reached
+`configureStreamsFeed`, `setForwarder` or `addPair`.
+
+For a short window prod's Settlement pointed at a resolver with **no stream
+configuration**, which would have opened markets it could never settle. It was
+harmless only because the paired cycler had no pairs, so nothing could be
+created. The run that succeeded immediately afterwards is `prod-25747248.json`.
+
+The cycler was deprecated on 2026-08-13 (tx
+`0x5da91b5ae75e12ca62e544532ad1c22718b2c01e9b23d6dd8f6415b5fd22e296`) so it can
+never accept keeper work. Both contracts are inert; they are listed here only so
+an audit run against this directory does not conclude they were never deployed.
+
+## Prod stack lineage
+
+| Resolver | AutoCycler | Record | State |
+|---|---|---|---|
+| `0xC906714a…654Bf` | `0x86f9020e…0288` | `prod-25724175.json` | Retired, cycler deprecated |
+| `0x4583B912…4996` | `0x027822Ce…f9C2` | `prod-25746267.json` | Retired, cycler deprecated |
+| `0x589118a9…e673` | `0x7D4fA2f9…bDA7` | *(none — see above)* | Aborted, cycler deprecated |
+| `0x9B524376…885a` | `0xF2DBC8C5…3544` | `prod-25747248.json` | **Live** (TWAP 30s) |
+
+Settlement `0x4B662f68…754e` is unchanged across all of them — every migration
+ran in `EXISTING_SETTLEMENT_ADDRESS` mode, so positions and collateral never
+moved.
