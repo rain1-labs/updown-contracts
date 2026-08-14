@@ -79,8 +79,39 @@ an audit run against this directory does not conclude they were never deployed.
 | `0xC906714a…654Bf` | `0x86f9020e…0288` | `prod-25724175.json` | Retired, cycler deprecated |
 | `0x4583B912…4996` | `0x027822Ce…f9C2` | `prod-25746267.json` | Retired, cycler deprecated |
 | `0x589118a9…e673` | `0x7D4fA2f9…bDA7` | *(none — see above)* | Aborted, cycler deprecated |
-| `0x9B524376…885a` | `0xF2DBC8C5…3544` | `prod-25747248.json` | **Live** (TWAP 30s) |
+| `0x9B524376…885a` | `0xF2DBC8C5…3544` | `prod-25747248.json` | Retired, cycler deprecated |
+| `0x8fae4F24…2076c` | `0x38288B85…49688` | `prod-25755446.json` | **Live** (TWAP 60s) |
 
 Settlement `0x4B662f68…754e` is unchanged across all of them — every migration
 ran in `EXISTING_SETTLEMENT_ADDRESS` mode, so positions and collateral never
 moved.
+
+### 2026-08-14 — TWAP 30s → 60s
+
+Chainlink granted the account entitlement for the `TWAP: 60s` streams on
+2026-08-14 (both ids had returned HTTP 401 "feeds not authorized" on 08-13 and
+again earlier on 08-14). The cutover deployed `prod-25755446.json` and the new
+resolver holds the 60s ids for both pairs.
+
+The old cycler `0xF2DBC8C5…3544` was deprecated after the cutover (tx
+`0x37c79ed53db36955d8423e7bc4ed951ecb152352fb5286a7cb8bc8f407a287aa`).
+
+**Six markets were orphaned by this run and later recovered.** The upgrade ran
+with `--skip-drain`, so `setResolver` fired while 2523, 2526, 2540, 2542, 2545
+and 2546 were still open. All six were re-adopted on the new resolver with
+`registerMarket` and resolved normally — the resolver service picked them up on
+its own once registered, with no `ResolveFailed`.
+
+One of them held real money, and the timeline is the point:
+
+```
+19:43:30  drain scan records market 2542 notional 0
+19:43:49  two users enter opposite sides, 31.25 USDT each
+19:44:15  deploy repoints Settlement -> 2542 orphaned
+19:45:00  market 2542 ends, unresolvable by either resolver
+```
+
+The preflight was correct when it ran; the collateral arrived 19 seconds later.
+`--skip-drain`'s "safe when the open markets are empty" check reads one instant,
+and open markets keep taking positions after it. Market 2542 settled 1875.874 ->
+1877.725 (option 1), and the 62.50 USDT became redeemable again.
