@@ -69,24 +69,14 @@ array. The owner may also call `pruneResolved()` manually, or `evictUnresolved(m
 
 ## Timeframes
 
-> **Source and chain disagree right now.** `NUM_TIMEFRAMES` is **2** in this repo — the
-> 60-minute slot was deleted on 2026-08-18. The **deployed** dev and prod cyclers still carry
-> the 3-slot layout with index 2 merely disabled via `toggleTimeframe(2, false)`. Until a
-> redeploy, that disable flag is the only thing holding prod, with the soft-gate caveat below.
-> Read the "removed" wording as describing the source; read the toggle procedure as describing
-> the live stack.
+`UpDownAutoCycler` cycles three fixed timeframes, seeded in the constructor and toggled by the
+owner with `toggleTimeframe(uint256 index, bool active)`:
 
-`UpDownAutoCycler` cycles fixed timeframes seeded in the constructor and toggled by the owner
-with `toggleTimeframe(uint256 index, bool active)`:
-
-| Index | Duration | Dispute | Market | In source | On chain |
-|---|---|---|---|---|---|
-| 0 | 300s | 600s | 5-minute | yes | yes, active |
-| 1 | 900s | 1800s | 15-minute | yes | yes, active |
-| 2 | 3600s | 7200s | 60-minute | **removed** | present, **disabled** |
-
-Indices 0 and 1 keep their values across the removal, so `pairTfLastCreated` and every
-off-chain consumer keyed on `tfIdx` survive a redeploy unrenumbered.
+| Index | Duration | Dispute | Market | State |
+|---|---|---|---|---|
+| 0 | 300s | 600s | 5-minute | active |
+| 1 | 900s | 1800s | 15-minute | active |
+| 2 | 3600s | 7200s | 60-minute | **disabled 2026-08-18 on dev + prod** |
 
 ```bash
 cast send $CYCLER "toggleTimeframe(uint256,bool)" 2 false \
@@ -105,19 +95,25 @@ hand-crafting a `CreateSlot`. That is not reachable by accident — an honest ke
 slot that expires `RESOLVER_MAX_STALENESS` after its `endTime`. But do not treat the toggle as
 a hard block when the threat model includes a compromised keeper key.
 
-A timeframe cannot be removed **on a deployed contract**. `NUM_TIMEFRAMES` is a `constant`,
+A timeframe cannot be *removed* from a deployed contract. `NUM_TIMEFRAMES` is a `constant`,
 `timeframes` is a fixed-size array, and durations are written only in the constructor — the
-whole owner surface can set `.active` and nothing else. That is why removal required a source
-change and why it is not yet live.
+whole owner surface can set `.active` and nothing else. Index 2 therefore stays as a dormant
+slot, costing one `SLOAD` per pair inside an off-chain `view`.
 
-Shipping it needs new bytecode. Prefer a **cycler-only** redeploy against the existing resolver
-and settlement: `Deploy.s.sol` always mints a fresh resolver too (it only supports reusing the
-settlement, via `EXISTING_SETTLEMENT_ADDRESS`), and swapping the resolver is the step that
-orphaned six markets on 2026-08-14 — plus a new resolver address needs Chainlink allow-listing
-with external lead time. A cycler-only swap needs `settlement.setAutocycler`,
+Deleting it was evaluated on 2026-08-18 and **deliberately not pursued**: it needs new
+bytecode, and the scripted path (`Deploy.s.sol`) always mints a fresh resolver alongside the
+cycler — it only supports reusing the settlement, via `EXISTING_SETTLEMENT_ADDRESS`. Swapping
+the resolver is the step that orphaned six markets on 2026-08-14, and a new resolver address
+needs Chainlink allow-listing with external lead time. That is a live-stack migration in
+exchange for deleting a dormant array entry.
+
+If it is ever revisited, prefer a **cycler-only** redeploy against the existing resolver and
+settlement — the cycler constructor takes both as addresses, and leaving the resolver alone
+avoids the orphaning failure mode entirely. It needs `settlement.setAutocycler`,
 `resolver.setAuthorizedCaller(new, true)`, then `setForwarder` / `addPair` ×2 /
-`setPreStartWindowSec(300)` on the new cycler, and `deprecate` on the old one. See
-[`../deployments/README.md`](../deployments/README.md).
+`setPreStartWindowSec(300)` on the new cycler, and `deprecate` on the old one. Removing the
+last index leaves 0 and 1 unrenumbered, so `pairTfLastCreated` and off-chain consumers keyed on
+`tfIdx` survive. See [`../deployments/README.md`](../deployments/README.md).
 
 **It stops creation only.** Markets already open keep trading and still need the resolver
 service to settle them at their `endTime` — do not pair this with disabling the resolver, or

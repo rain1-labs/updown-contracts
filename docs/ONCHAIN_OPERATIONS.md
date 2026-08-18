@@ -49,10 +49,8 @@ cast send <CYCLER> "addPair(bytes32)" "$PAIR" --rpc-url $ARBITRUM_RPC_URL --acco
 `removePair` is the inverse — it stops new markets for the pair while leaving open ones to
 resolve normally.
 
-Stop one timeframe across every cycling pair (owner only). On the **currently deployed**
-cyclers the indices are 0 = 5m, 1 = 15m, 2 = 60m; in source the 60m slot has been removed and
-`NUM_TIMEFRAMES` is 2, so index 2 reverts `InvalidTimeframeIndex` on anything deployed from
-`main` after 2026-08-18:
+Stop one timeframe across every cycling pair (owner only) — index 0 = 5m, 1 = 15m, 2 = 60m.
+Index 2 is currently disabled on both dev and prod:
 
 ```bash
 cast send <CYCLER> "toggleTimeframe(uint256,bool)" 2 false \
