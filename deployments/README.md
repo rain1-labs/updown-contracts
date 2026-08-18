@@ -115,3 +115,45 @@ The preflight was correct when it ran; the collateral arrived 19 seconds later.
 `--skip-drain`'s "safe when the open markets are empty" check reads one instant,
 and open markets keep taking positions after it. Market 2542 settled 1875.874 ->
 1877.725 (option 1), and the 62.50 USDT became redeemable again.
+
+## Owner actions (not deploys)
+
+Owner-gated state changes that alter live behaviour but mint no addresses, so
+`Deploy.s.sol` writes no record for them. Logged here because this directory is
+the audit trail for "who changed what on the live stack".
+
+### 2026-08-18 — 60-minute timeframe disabled on both environments
+
+`toggleTimeframe(2, false)` on the AutoCycler. Timeframe index 2 is the
+3600s / 7200s-dispute slot; indices 0 (5m) and 1 (15m) were left `active`.
+
+| Env | Cycler | Tx | Arbitrum block |
+|---|---|---|---|
+| dev | `0x8495c2d3…325172` | `0x75919bb325f66cca24db760df6c0612361f4ed6702bfad94a2cf5e46be3a8b6e` | 495453890 |
+| prod | `0x38288B85…49688` | `0x272656188ec4d509801b9a39176d994a82556b28e9501371bec8c92e42fc0944` | 495792252 |
+
+Both sent from the deployer/owner EOA of their environment (dev
+`0x1B4320cC…26E6a`, prod `0xCEcEF153…f3c32`) — neither stack has completed an
+`OWNER_ADDRESS` handoff, so `pendingOwner` is zero on both.
+
+One call covers **both cycling pairs**: the flag lives on the timeframe, not the
+pair, so BTC/USD and ETH/USD stopped together.
+
+Prod landed at 10:10 UTC. The next hourly slot (start 11:00) would not have
+become eligible until 10:55 — `next_start − preStartWindowSec`, the window
+being 300s — so the 11:00 market was never created. Markets 5479 and 5482 were
+already open for the 10:00–11:00 slot and were deliberately left alone; nothing
+about this flag touches an existing market, so both stay on the normal resolver
+path and settle at their 11:00 UTC `endTime` (unverified at the time of writing
+— they were still `resolved=false` 47 min ahead of the boundary; confirm with
+`getMarket` rather than assuming). All six active prod markets carried
+**0.00 USDT** notional at the time of the call, so no user collateral was in
+scope. Contrast the 2026-08-14
+cutover above, where an owner action did strand open markets.
+
+**The pointers freeze.** `pairTfLastCreated[<pair>][2]` stops advancing while
+the timeframe is off, at `1787047200` (2026-08-18 10:00 UTC) on prod and
+`1786744800` (2026-08-14 22:00 UTC) on dev. It does not resume from "now" on
+re-enable — see the re-enable procedure in
+[`../docs/operations.md`](../docs/operations.md#timeframes). Flipping the flag
+back on alone makes the cycler grind one skipped hour per `performUpkeep`.
