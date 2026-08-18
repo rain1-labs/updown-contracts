@@ -49,6 +49,19 @@ cast send <CYCLER> "addPair(bytes32)" "$PAIR" --rpc-url $ARBITRUM_RPC_URL --acco
 `removePair` is the inverse — it stops new markets for the pair while leaving open ones to
 resolve normally.
 
+Stop one timeframe across every cycling pair (owner only) — index 0 = 5m, 1 = 15m, 2 = 60m.
+Index 2 is currently disabled on both dev and prod:
+
+```bash
+cast send <CYCLER> "toggleTimeframe(uint256,bool)" 2 false \
+  --rpc-url $ARBITRUM_RPC_URL --account <OWNER>
+```
+
+Like `removePair`, this gates creation only; open markets still resolve. Re-enabling needs
+`setPairTfLastCreated` on each pair first or the cycler grinds through every skipped slot one
+`performUpkeep` at a time — full procedure and the current disabled state in
+[`operations.md`](./operations.md#timeframes).
+
 The legacy push-feed setter `configureFeed(bytes32,address)` still exists but only feeds
 `priceFeeds`, which the strike/resolve lifecycle no longer reads.
 
