@@ -26,5 +26,10 @@ broadcast/
 .DS_Store
 Thumbs.db
 
+# Lock files
+package-lock.json
+yarn.lock
+foundry.lock
+
 docs/csco-reports/
 audit-repro/
