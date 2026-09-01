@@ -48,6 +48,80 @@ Owner clawback is `withdrawLink(amount)`. `Deploy.s.sol` cites a 5 LINK floor.
 - `proposeEmergencyWithdraw(token, to, amount)` → wait `EMERGENCY_TIMELOCK` (24h) →
   `executeEmergencyWithdraw(proposalId)`. Cancel with `cancelEmergencyWithdraw`.
 
+## Fee buyback-and-burn
+
+`platformFee` no longer lands in the treasury on each fill. It accrues to the round that earned
+it (`marketFeeAccrued[marketId]`, summed in `feesAccrued`), and `resolve` spends that round's
+bucket buying RAIN on Uniswap V3 and burning everything it receives. A round's bucket is already
+final when `resolve` runs, because fills revert at `endTime`.
+
+- **Configure once:** `setBuybackRoute(rainToken, router, quoter, path)`. The path must start at
+  USDT and end at the burn token or the call reverts `InvalidBuybackPath` — a misconfiguration
+  fails here rather than as a silent stream of fallback events. `Deploy.s.sol` composes the
+  USDT → WETH → RAIN path from env and calls this when `RAIN_TOKEN_ADDRESS` is set.
+- **Slippage:** derived on-chain per burn as `quote × (10000 − buybackSlippageBps) / 10000`
+  (default 300 = 3%). Resolution has no caller to supply an `amountOutMinimum`, so it cannot be
+  a call argument. Tune with `setBuybackSlippageBps`.
+- **The burn cannot block a resolution.** An unset route, a reverting quoter or router, a dry
+  pool (zero quote), a token that refuses to burn, or a treasury that cannot receive all degrade
+  instead of reverting. This matters because `redeem` reverts `NotResolved` until `resolve`
+  lands — a DEX problem must never become a redemption outage.
+
+### Monitoring
+
+| Event | Meaning | Action |
+|---|---|---|
+| `FeesBoughtBackAndBurned` | Normal path — the round's fee became burned RAIN. Carries the burned amount only; the USDT spent is the sum of that round's `PlatformFeeAccrued`. | none |
+| `BuybackFallbackToTreasury` | Burn failed; value forwarded to the treasury. `token` says which stage failed: USDT = quote/swap, RAIN = the burn itself. `reason` carries the raw revert. | triage the route; the forwarded value is in the treasury, not recoverable by `buybackAndBurn` |
+| `BuybackDeferred` | Burn failed AND the forward failed (or no treasury set). The fee is re-credited to its own round and is still in the contract. | fix the route, then `buybackAndBurn([marketId])` |
+
+A steady stream of either fallback event means the route is wrong or the pool is too thin for
+the fee sizes being burned — not that funds are lost.
+
+### Route health (measured on Arbitrum One, 2026-09-01)
+
+Verified against the live chain by `test/FeeBuybackBurn.t.sol`. That suite uses **no mocks** — real
+USDT, real RAIN, the real `SwapRouter` and `Quoter` — mirroring how `rain-contracts` tests its own
+`swapAndBurn`. Failure branches (dry pool, reverting router, unburnable token, unreceivable
+treasury) are injected with `vm.mockCallRevert` against those same real addresses, so each one
+exercises the real settlement path with exactly one external answer replaced.
+
+- RAIN `0x25118290e6A5f4139381D072181157035864099d` **does** implement `burn(uint256)` — a
+  resolution burned 299.35 RAIN for a 5 USDT round fee and the token's `totalSupply` fell by
+  exactly that amount.
+- The `USDT --500--> WETH --100--> RAIN` path (the tiers `Deploy.s.sol` encodes) quotes and fills.
+- **Depth is comfortable.** Price impact from a 5 USDT burn to a 1,440 USDT burn (one pair's
+  whole day of 5-minute rounds) is **8 bps** — far inside the 300 bps default tolerance. Batching
+  burns via `buybackAndBurn` is therefore safe if per-resolve gas ever becomes the binding cost.
+
+```bash
+npm run test:buyback          # buyback suite only
+npm run test:fork             # whole suite, forked (invariants excluded)
+```
+
+Both default to the public `https://arb1.arbitrum.io/rpc` and use `ARBITRUM_RPC_URL` when set. CI
+runs the forked suite on every branch (`buyback-fork-test`), falling through a list of RPCs. Run
+unforked, the buyback tests **skip** rather than pass silently — `forge test` alone does not cover
+this feature.
+
+Re-run this after any route change (a new fee tier, a migrated pool) — a route that quotes zero
+sends every round to the treasury fallback silently.
+
+### Retry
+
+`buybackAndBurn(marketIds)` — owner or `buybackExecutor`. Works on any round past its `endTime`,
+including rounds that ended but were never resolved, so fee revenue is not hostage to resolution.
+Reverts `RoundNotEnded` for an in-flight round and `NothingToBuyback` when every named round is
+already empty. `pendingBuyback(marketIds)` is the matching view for picking a batch.
+
+### Gas
+
+`resolve` now performs a quoter call, a swap and a burn on any round that took a fee — budget
+materially more gas per resolution than before. `ChainlinkResolver` wraps `settlement.resolve` in
+try/catch, so an under-gassed keeper tx surfaces as `ResolveFailed` and leaves the market
+retryable rather than corrupting state; a keeper that is chronically short on gas will show up as
+markets that never resolve.
+
 ## Rebates
 
 - `accumulateRebate(maker, amount)` — relayer-only, credits a counter, moves no funds.

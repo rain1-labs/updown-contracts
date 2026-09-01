@@ -4,6 +4,7 @@ pragma solidity ^0.8.29;
 import {Test, Vm} from "forge-std/Test.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
+import {ForkSafeWallet} from "./utils/ForkSafeWallet.sol";
 
 /// @title Batch settlement proof suite (`mintMatchBatch` / `mergeMatchBatch` / `enterPositionBatch`).
 /// @notice The batch entrypoints exist to lift the single-relayer settlement ceiling: they collapse
@@ -47,7 +48,7 @@ contract SettlementBatchTest is Test {
     // ── Helpers (mirror ComplementaryMatch.t.sol) ───────────────────────
 
     function _wallet(string memory name) internal returns (Vm.Wallet memory w) {
-        w = vm.createWallet(name);
+        w = ForkSafeWallet.derive(name);
         usdt.mint(w.addr, 1_000_000e18);
         vm.prank(w.addr);
         usdt.approve(address(s), type(uint256).max);
@@ -200,8 +201,11 @@ contract SettlementBatchTest is Test {
         assertEq(s.optionShares(midA, UP), s.optionShares(midB, UP), "UP supply equal");
         assertEq(s.optionShares(midA, DOWN), s.optionShares(midB, DOWN), "DOWN supply equal");
         assertEq(s.marketRetained(midA), s.marketRetained(midB), "backing equal");
-        // Treasury received the platformFee from all 6 fills (3 per path) — same absolute total.
-        assertEq(usdt.balanceOf(treasury), 6e18, "treasury got platformFee from all fills");
+        // The platformFee from all 6 fills (3 per path) accrued to the two rounds' burn buckets —
+        // batching does not change where a fee lands, only how many calls deliver it.
+        assertEq(s.marketFeeAccrued(midA), 3e18, "singles path accrued 3 fills' platformFee");
+        assertEq(s.marketFeeAccrued(midB), 3e18, "batch path accrued the identical amount");
+        assertEq(s.feesAccrued(), 6e18, "aggregate fee accounting covers both rounds");
     }
 
     /// A one-element batch is indistinguishable from a single call.
@@ -415,7 +419,8 @@ contract SettlementBatchTest is Test {
             // buyer paid 60 cash + 3 fees (2 platform + 1 maker); taker (=buyer here) pays fees.
             assertEq(usdt.balanceOf(buyers[i].addr), 1_000_000e18 - 60e18 - 3e18, "buyer paid cash + fees");
         }
-        assertEq(usdt.balanceOf(treasury), treasury0 + 4e18, "treasury got 2 fills' platformFee");
+        assertEq(usdt.balanceOf(treasury), treasury0, "treasury no longer receives platformFee");
+        assertEq(s.marketFeeAccrued(mid), 4e18, "2 fills' platformFee accrued to the burn bucket");
         // enterPosition moves shares peer-to-peer; backing is only the two minted sets.
         assertEq(s.marketRetained(mid), 200e18, "backing unchanged by transfers");
     }

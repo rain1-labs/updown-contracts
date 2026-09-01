@@ -15,6 +15,10 @@
     "verify:dev": "set -a && . ./.env.dev && set +a && DEPLOY_LABEL=dev forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --verify --resume --retries 10 --delay 20",
     "verify:prod": "set -a && . ./.env.prod && set +a && DEPLOY_LABEL=prod forge script script/Deploy.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --verify --resume --retries 10 --delay 20",
     "mockdon:dev": "set -a && . ./.env.dev && set +a && forge script script/DeployMockDon.s.sol --rpc-url \"$ARBITRUM_RPC_URL\" --broadcast",
-    "fork:test": "FOUNDRY_PROFILE=fork forge test --match-contract ForkTest -vvv"
+    "fork:test": "FOUNDRY_PROFILE=fork forge test --match-contract ForkTest -vvv",
+    "test": "forge test -vv",
+    "test:fork": "forge test --fork-url \"${ARBITRUM_RPC_URL:-https://arb1.arbitrum.io/rpc}\" --fork-retries 10 --fork-retry-backoff 2000 --no-match-path 'test/UpDownPROInvariant.t.sol' -vv",
+    "test:buyback": "forge test --fork-url \"${ARBITRUM_RPC_URL:-https://arb1.arbitrum.io/rpc}\" --fork-retries 10 --fork-retry-backoff 2000 --match-contract FeeBuybackBurn -vv",
+    "test:buyback:dev": "BUYBACK_TEST_USDT=0xCa4f77A38d8552Dd1D5E44e890173921B67725F4 BUYBACK_TEST_RAIN=0x43976a124e6834b541840Ce741243dAD3dd538DA npm run test:buyback"
   }
 }

@@ -4,6 +4,7 @@ pragma solidity ^0.8.29;
 import {Test, Vm} from "forge-std/Test.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
+import {ForkSafeWallet} from "./utils/ForkSafeWallet.sol";
 
 /// @title Remediation V2 proof suite (Hacken full-recommendation pass).
 /// @notice One test (or small cluster) per `Needs-decision` finding, proving the auditor's
@@ -44,7 +45,7 @@ contract RemediationV2Test is Test {
     }
 
     function _wallet(string memory name) internal returns (Vm.Wallet memory w) {
-        w = vm.createWallet(name);
+        w = ForkSafeWallet.derive(name);
         usdt.mint(w.addr, 1_000_000e18);
         vm.prank(w.addr);
         usdt.approve(address(s), type(uint256).max);
@@ -90,12 +91,7 @@ contract RemediationV2Test is Test {
         returns (UpDownSettlement.MintAuth memory a)
     {
         a = UpDownSettlement.MintAuth({
-            account: w.addr,
-            market: mid,
-            action: action,
-            amount: amount,
-            nonce: nonce,
-            expiry: block.timestamp + 3600
+            account: w.addr, market: mid, action: action, amount: amount, nonce: nonce, expiry: block.timestamp + 3600
         });
     }
 
@@ -171,10 +167,14 @@ contract RemediationV2Test is Test {
         assertEq(s.sharesOf(mid, alice.addr, UP), 0, "seller gave up UP");
         // cashPart = 60% * 100 = 60; buyer(bob) pays cash + fees (taker pays).
         assertEq(usdt.balanceOf(bob.addr), bob0 - 60e18 - 3e18, "taker(buyer) paid cash + all fees");
-        assertEq(usdt.balanceOf(treasury), treasury0 + 2e18, "treasury got platformFee");
+        // Buyback change: platformFee no longer reaches the treasury — it is booked to the
+        // round's burn bucket inside the contract and retired at `resolve`.
+        assertEq(usdt.balanceOf(treasury), treasury0, "treasury no longer receives platformFee");
+        assertEq(s.marketFeeAccrued(mid), 2e18, "platformFee accrued to the round's burn bucket");
+        assertEq(s.feesAccrued(), 2e18, "aggregate fee accounting tracks it");
         assertEq(usdt.balanceOf(alice.addr), alice0 + 60e18 + 1e18, "maker got cash + makerFee, no fee charged");
-        // Contract balance unchanged by the fill (peer-to-peer; pool untouched).
-        assertEq(usdt.balanceOf(address(s)), 100e18, "fill is balance-neutral for the pool");
+        // The fill still leaves backing untouched; the pool now also holds the accrued fee.
+        assertEq(usdt.balanceOf(address(s)), 100e18 + 2e18, "backing untouched, fee held for buyback");
     }
 
     /// Direction 2: maker is the BUYER, taker is the SELLER. Taker STILL pays fees
@@ -197,7 +197,8 @@ contract RemediationV2Test is Test {
         // carol is the SELLER but the TAKER → she pays the fees, receives cash.
         // net = +cash(60) - fees(3) = +57
         assertEq(usdt.balanceOf(carol.addr), carol0 + 60e18 - 3e18, "taker(seller) paid fees despite being the seller");
-        assertEq(usdt.balanceOf(treasury), treasury0 + 2e18);
+        assertEq(usdt.balanceOf(treasury), treasury0, "treasury no longer receives platformFee");
+        assertEq(s.marketFeeAccrued(mid), 2e18, "platformFee accrued to the round's burn bucket");
     }
 
     function test_F17757_invalidTakerSignature_reverts() public {
@@ -260,7 +261,7 @@ contract RemediationV2Test is Test {
         // Fill #1: 20 shares, charging the whole 5e18 cap. Cumulative 0 -> 5e18 == cap → OK.
         UpDownSettlement.Order memory m1 = _order(carol, mid, UP, SELL, 6000, 20e18, 0, 201);
         _enter(m1, carol, takerO, bob, 20e18, 5e18, 0);
-        assertEq(usdt.balanceOf(treasury), treasury0 + 5e18, "first fill consumed the whole cap");
+        assertEq(s.marketFeeAccrued(mid), 5e18, "first fill consumed the whole cap");
         assertEq(s.orderFeesPaid(s.hashOrder(takerO)), 5e18, "cumulative taker fees recorded");
 
         // Fill #2 against the SAME taker order: ANY extra fee now exceeds the cumulative cap → revert.
@@ -290,7 +291,7 @@ contract RemediationV2Test is Test {
         });
         vm.prank(relayer);
         s.enterPosition(f0);
-        assertEq(usdt.balanceOf(treasury), treasury0 + 5e18, "no fees beyond the signed cap were ever pulled");
+        assertEq(s.marketFeeAccrued(mid), 5e18, "no fees beyond the signed cap were ever pulled");
     }
 
     // ─────────────────────────────────────────────────────────────────────

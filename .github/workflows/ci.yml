@@ -70,6 +70,57 @@ jobs:
         continue-on-error: true
         run: forge fmt --check
 
+  buyback-fork-test:
+    name: buyback tests (Arbitrum One fork)
+    # Runs on EVERY branch, unlike the `fork-test` job below. It needs no ffi and
+    # no secrets — public Arbitrum RPCs are enough — and it is the only thing that
+    # proves the half of the fee buyback living outside our code: that RAIN really
+    # implements `burn`, that the USDT -> WETH -> RAIN route exists at the fee tiers
+    # `Deploy.s.sol` encodes, and that the quoter-derived floor is fillable on it.
+    # Mirrors rain-contracts' own CI, which forks Arbitrum for its whole suite.
+    #
+    # The invariant suite is excluded: it is fuzzed over thousands of calls and does
+    # not touch the buyback route, so forking it only buys RPC round-trips.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # Public endpoints rate-limit and occasionally 5xx, so fall through a list
+      # rather than failing the branch on one bad provider. ARBITRUM_RPC_URL is
+      # tried first when the secret exists; it is not required.
+      - name: Forked tests
+        run: |
+          RPCS=(
+            "${{ secrets.ARBITRUM_RPC_URL }}"
+            "https://arb1.arbitrum.io/rpc"
+            "https://arbitrum.drpc.org"
+          )
+          for rpc in "${RPCS[@]}"; do
+            [ -z "$rpc" ] && continue
+            echo "Trying RPC: ${rpc:0:30}..."
+            if forge test \
+              --fork-url "$rpc" \
+              --fork-retries 10 \
+              --fork-retry-backoff 2000 \
+              --no-match-path 'test/UpDownPROInvariant.t.sol' \
+              -vv; then
+              exit 0
+            fi
+            echo "Failed, trying next RPC..."
+          done
+          echo "All RPCs failed"
+          exit 1
+
   fork-test:
     name: fork tests (real DON)
     # Deliberately NOT widened to every branch along with the `test` job. Two

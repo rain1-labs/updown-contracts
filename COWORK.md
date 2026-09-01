@@ -65,8 +65,25 @@ through rain.trade's Alchemy Modular Account v2 (see `test/OrderSessionForkTest.
   — the maximum TOTAL fee that signer accepts across all fills of that order. Relayer-supplied
   fees exceeding it revert `FeeExceedsTakerCap` (F-2026-17731). `orderFeesPaid` accumulates
   per order hash so partial fills cannot be split to charge the cap N times.
-- Fees are **taker-paid and peer-to-peer**: `platformFee` → `treasury`, `makerFee` → the maker.
-  Neither ever touches market backing. A pure resting maker order pays no fee.
+- Fees are **taker-paid**: `makerFee` goes peer-to-peer to the maker; `platformFee` is retained
+  by the Settlement. Neither ever touches market backing. A pure resting maker order pays no fee.
+- **`platformFee` is bought back and burned per round.** It accrues to `marketFeeAccrued[marketId]`
+  (aggregated in `feesAccrued`), and `resolve` spends that round's bucket buying RAIN on Uniswap V3
+  and calls `ERC20Burnable.burn` on everything it receives — the same swap-then-burn the RAIN
+  protocol runs in `LibUtils.swapAndBurn`, triggered at round end instead of first claim. A round's
+  bucket is already final at `endTime` because fills revert there.
+  - The slippage floor is derived on-chain (`IQuoter.quoteExactInput` × `10000 - buybackSlippageBps`,
+    default 300 = 3%), since resolution has no caller to supply a trustworthy `amountOutMinimum`.
+  - **The burn can never block a resolution.** Every external call is wrapped: an unset route, a
+    reverting quoter or router, a dry pool, or a token that refuses to burn all forward the value to
+    `treasury` (`BuybackFallbackToTreasury`) rather than reverting — resolution is what unlocks
+    redemptions, so it must not be hostage to a DEX. With no treasury configured the fee is
+    re-credited to its own round (`BuybackDeferred`) and stays retrievable.
+  - `buybackAndBurn(marketIds)` is the owner/`buybackExecutor` retry for rounds that fell back, or
+    for rounds that ended but were never resolved. Route config is owner-only via `setBuybackRoute`,
+    which validates the V3 path starts at USDT and ends at the burn token.
+  - Global solvency is now `usdt.balanceOf(settlement) == Σ marketRetained + feesAccrued`; the two
+    pots are disjoint, so a burn can never spend collateral owed to winners.
 - Market-maker rebates are separate: `accumulateRebate` credits a counter (relayer-called),
   claimed later via permissionless `claimRebate`, bounded by a rolling
   `rebateBudgetPerWindow` / `rebateWindowDuration` circuit-breaker (F-2026-17779).

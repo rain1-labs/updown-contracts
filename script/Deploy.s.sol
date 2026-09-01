@@ -101,13 +101,27 @@ contract DeployUpDown is Script {
     ///      `UpDownAutoCycler.PRE_START_WINDOW_MAX` (300).
     uint256 constant PRE_START_WINDOW_DEFAULT = 300;
 
+    // ── Fee buyback-and-burn defaults (Arbitrum One) ─────────────────────
+    // Platform fees accrue per round inside the Settlement and are spent buying RAIN and
+    // burning it when the round resolves. The route is env-driven and OPTIONAL: leave
+    // RAIN_TOKEN_ADDRESS unset and the deploy simply skips it — fees then accrue and are
+    // forwarded to the treasury on each resolve until ops calls `setBuybackRoute`.
+    address constant UNISWAP_V3_ROUTER_DEFAULT = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address constant UNISWAP_V3_QUOTER_DEFAULT = 0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6;
+    address constant WETH_DEFAULT = 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1;
+    /// @dev RAIN/WETH is the 0.01% tier, matching the RAIN protocol's own `RAIN_WETH_FEE`.
+    uint24 constant WETH_RAIN_FEE_DEFAULT = 100;
+    /// @dev USDT/WETH 0.05% — the deepest tier for the pair on Arbitrum One.
+    uint24 constant USDT_WETH_FEE_DEFAULT = 500;
+
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
         address usdt = vm.envAddress("USDT_ADDRESS");
         address relayer = vm.envAddress("RELAYER_ADDRESS");
-        // PR-5-bundle (P0-7): treasury must be configured pre-broadcast or
-        // any fill with platformFee > 0 reverts on TreasuryNotConfigured.
+        // Treasury funds rebate claims (`claimRebate` pulls from it via `transferFrom`) and is
+        // the fallback sink whenever a round's buyback cannot complete. It no longer receives
+        // `platformFee` on each fill — that accrues per round and is burned at resolution.
         address treasury = vm.envAddress("TREASURY_ADDRESS");
         // 2026-05-13 Data Streams swap: resolver constructor now also
         // takes the VerifierProxy + LINK token addresses. Both must be
@@ -127,6 +141,16 @@ contract DeployUpDown is Script {
         // must abort rather than defer to a post-deploy checklist.
         bytes32 btcStreamsFeedId = vm.envBytes32("STREAMS_FEED_ID_BTC_USD");
         bytes32 ethStreamsFeedId = vm.envBytes32("STREAMS_FEED_ID_ETH_USD");
+
+        // Fee buyback route. Optional: unset RAIN_TOKEN_ADDRESS skips configuration entirely.
+        address rainToken = vm.envOr("RAIN_TOKEN_ADDRESS", address(0));
+        address swapRouter = vm.envOr("UNISWAP_V3_ROUTER", UNISWAP_V3_ROUTER_DEFAULT);
+        address swapQuoter = vm.envOr("UNISWAP_V3_QUOTER", UNISWAP_V3_QUOTER_DEFAULT);
+        address weth = vm.envOr("WETH_ADDRESS", WETH_DEFAULT);
+        uint24 usdtWethFee = uint24(vm.envOr("BUYBACK_USDT_WETH_FEE", uint256(USDT_WETH_FEE_DEFAULT)));
+        uint24 wethRainFee = uint24(vm.envOr("BUYBACK_WETH_RAIN_FEE", uint256(WETH_RAIN_FEE_DEFAULT)));
+        // Defaults to the relayer so the backend can sweep rounds whose automatic burn fell back.
+        address buybackExecutor = vm.envOr("BUYBACK_EXECUTOR_ADDRESS", relayer);
 
         uint256 preStartWindowSec = vm.envOr("PRE_START_WINDOW_SEC", PRE_START_WINDOW_DEFAULT);
         // Defaults to the relayer, preserving the previous behaviour for dev.
@@ -202,6 +226,29 @@ contract DeployUpDown is Script {
         settlement.setTreasury(treasury);
         // F-2026-17779: seed the rolling rebate budget circuit-breaker.
         settlement.setRebateBudget(REBATE_BUDGET_PER_WINDOW, REBATE_WINDOW_DURATION);
+
+        // Fee buyback-and-burn. Skipped when RAIN_TOKEN_ADDRESS is unset — a dev network with no
+        // RAIN pool must still deploy, and an unconfigured route degrades safely (fees accrue and
+        // are forwarded to the treasury at each resolve, retrievable later via `buybackAndBurn`).
+        // `setBuybackRoute` validates the path endpoints, so a wrong pair fails the deploy here
+        // rather than as a silent stream of fallback events in production.
+        //
+        // ALSO skipped in migration mode. The Settlement is NOT a proxy: reusing
+        // EXISTING_SETTLEMENT_ADDRESS keeps the OLD bytecode, which has no buyback at all — the
+        // setter would not exist and the call would revert mid-broadcast. Shipping the buyback
+        // therefore requires a FRESH Settlement deploy, which in turn means migrating user shares
+        // and allowances. Warn loudly rather than failing an otherwise-valid migration deploy.
+        if (rainToken != address(0) && existingSettlement == address(0)) {
+            bytes memory buybackPath = abi.encodePacked(usdt, usdtWethFee, weth, wethRainFee, rainToken);
+            settlement.setBuybackRoute(rainToken, swapRouter, swapQuoter, buybackPath);
+            settlement.setBuybackExecutor(buybackExecutor);
+            console.log("Buyback route: USDT -> WETH -> RAIN via", swapRouter);
+        } else if (rainToken != address(0)) {
+            console.log("Buyback route: SKIPPED -- migration mode reuses the old Settlement bytecode,");
+            console.log("  which predates the buyback. Deploy a fresh Settlement to enable it.");
+        } else {
+            console.log("Buyback route: UNSET (RAIN_TOKEN_ADDRESS empty) -- fees fall back to treasury");
+        }
 
         // F-2026-17760: the cycler captures strikes; the relayer (resolver service) submits
         // resolutions. Both must be authorized now that resolve/captureStrike are access-gated.

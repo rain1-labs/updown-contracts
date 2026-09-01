@@ -4,6 +4,7 @@ pragma solidity ^0.8.29;
 import {Test, Vm} from "forge-std/Test.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
+import {ForkSafeWallet} from "./utils/ForkSafeWallet.sol";
 
 /// @title Complementary matching (MINT / MERGE) proof suite.
 /// @notice Proves the "buy UP = sell DOWN" duality realised on-chain: two BUY orders on opposite
@@ -49,7 +50,7 @@ contract ComplementaryMatchTest is Test {
     // ── Helpers (mirror of RemediationV2.t.sol) ─────────────────────────
 
     function _wallet(string memory name) internal returns (Vm.Wallet memory w) {
-        w = vm.createWallet(name);
+        w = ForkSafeWallet.derive(name);
         usdt.mint(w.addr, 1_000_000e18);
         vm.prank(w.addr);
         usdt.approve(address(s), type(uint256).max);
@@ -204,10 +205,12 @@ contract ComplementaryMatchTest is Test {
         s.mintMatch(f);
 
         assertEq(usdt.balanceOf(bob.addr), bob0 - 40e18 - 3e18, "taker paid cash + all fees");
-        assertEq(usdt.balanceOf(treasury), treasury0 + 2e18, "treasury got platformFee");
+        // Buyback change: platformFee is booked to the round's burn bucket, not paid to treasury.
+        assertEq(usdt.balanceOf(treasury), treasury0, "treasury no longer receives platformFee");
+        assertEq(s.marketFeeAccrued(mid), 2e18, "platformFee accrued to the round's burn bucket");
         assertEq(usdt.balanceOf(alice.addr), alice0 - 60e18 + 1e18, "maker paid cash, got makerFee");
         assertEq(s.orderFeesPaid(s.hashOrder(downBuy)), 3e18, "cumulative taker fees recorded");
-        assertEq(usdt.balanceOf(address(s)), 100e18, "pool holds only backing");
+        assertEq(usdt.balanceOf(address(s)), 100e18 + 2e18, "pool holds backing + the accrued fee");
     }
 
     function test_mintMatch_feeCapEnforced() public {
