@@ -157,3 +157,71 @@ the timeframe is off, at `1787047200` (2026-08-18 10:00 UTC) on prod and
 re-enable — see the re-enable procedure in
 [`../docs/operations.md`](../docs/operations.md#timeframes). Flipping the flag
 back on alone makes the cycler grind one skipped hour per `performUpkeep`.
+
+### 2026-09-02 — dev redeployed twice for the fee buyback
+
+Dev only. Prod is untouched and still runs the pre-buyback Settlement, so
+`platformFee` there continues to go to the treasury on each fill.
+
+| Record | Settlement | Resolver | AutoCycler |
+|---|---|---|---|
+| `dev-25882680.json` | `0xE607dD4b…72fFa9` | `0xEe8254C5…aa90aa` | `0x6a87A81C…bdCFEA` |
+| `dev-25889013.json` | `0xB1c5b4A4…a2313b` | `0x48fD463D…555ADf` | `0xbCC639e7…bd8982` |
+
+`dev-25889013` is live. Both are fresh Settlements, not migrations: the
+Settlement is not upgradeable and `ChainlinkResolver.trustedSettlement` /
+`UpDownAutoCycler.settlement`+`resolver` are immutable, so one Settlement change
+replaces all three addresses. The pre-buyback dev stack
+(`0x8EA9Cdc4…d055F4`) and `dev-25882680` are both orphaned.
+
+**Why twice.** The first deploy ran the buyback inside `resolve`. That coupling
+broke resolution for every fee-bearing round:
+
+| resolve | gas |
+|---|---|
+| round with no fee (burn short-circuits) | ~122,650 |
+| round with a fee (quoter + swap + burn) | ~489,750 |
+
+The relayer sized gas from an estimate plus ~3%, which was correct while
+`resolve` was deterministic. With a Uniswap swap inside, the cost moves with
+pool state, and one tx came up **37 gas short** — limit 489,625, needed
+489,662. Market 11 retried six times and never resolved; it lapsed past the
+resolver's 1h `MAX_STALENESS` and is permanently unresolvable on the orphaned
+contract. Rounds with no fee resolved normally throughout, which is why only
+some markets stalled.
+
+try/catch did not save it: **it catches reverts, not gas exhaustion.** The
+`resolve` frame's own OOG rolled back every state write in it and no inner
+`catch` ran. `ChainlinkResolver` caught the failure one level up and emitted
+`ResolveFailed` with an empty reason, so the outer tx reported success while
+the round stayed unresolved.
+
+The second deploy takes the swap off that path entirely. `resolve` makes no
+external calls and needs no reentrancy guard; the burn is now keeper-driven via
+`buybackAndBurn(marketIds)`, eligible on `endTime` rather than resolution.
+`buybackExecutor` also became an allow-list (`buybackExecutors` mapping) so a
+backup keeper can be added without displacing the primary.
+
+**Stranded fees were retired before the redeploy.** `buybackAndBurn([11, 17])`
+on `0xE607dD4b…72fFa9` from the owner EOA, tx
+`0xb13b1767038c503fa18761e9bc1a4323e51a99dc231679bbdbe7de8415e5fd38` —
+2.134995 dev USDT spent, **14.2898 dev RAIN burned**, `feesAccrued` back to 0.
+That is also the first end-to-end proof of the buyback on a live chain.
+
+**Timeframes reset on each fresh cycler.** The constructor enables all three
+(5m / 15m / 60m) and `Deploy.s.sol` never touches them, so the 2026-08-18
+`toggleTimeframe(2, false)` above does **not** carry across a redeploy. It was
+re-applied to both dev cyclers:
+
+| Cycler | Tx |
+|---|---|
+| `0x6a87A81C…bdCFEA` (orphaned) | `0xc2ea5f19f8773c071ff7c48b11aca44a6192378a8a7c7671fe6d614b84793660` |
+| `0xbCC639e7…bd8982` (live) | `0xd5f2ea66486e84c40e5dbdb62cfc9f9b9bdde669c04a6e88ac4b8e3a00877392` |
+
+Both from the deployer/owner EOA. Any future redeploy needs this call again —
+it is not part of `Deploy.s.sol`.
+
+**Ownership.** Neither dev deploy set `OWNER_ADDRESS`, so the deployer EOA
+`0x1B4320cC…26E6a` owns all three and `pendingOwner` is zero — same posture as
+the earlier stacks recorded above.
+

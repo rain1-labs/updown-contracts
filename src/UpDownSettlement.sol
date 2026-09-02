@@ -24,14 +24,18 @@ import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 ///
 ///         FEE BUYBACK-AND-BURN: `platformFee` no longer leaves for a treasury EOA on each fill. It
 ///         accrues to the round that earned it (`marketFeeAccrued`, aggregated in `feesAccrued`) and
-///         `resolve` spends that round's bucket buying `buybackToken` (RAIN) on Uniswap V3 and
+///         `buybackAndBurn` spends those buckets buying `buybackToken` (RAIN) on Uniswap V3 and
 ///         burning every unit received — the same swap-then-burn the RAIN protocol runs in
-///         `LibUtils.swapAndBurn`, triggered at round end rather than at first claim. Fee USDT and
-///         backing USDT are disjoint claims on one balance, so the global solvency statement becomes
-///         `usdt.balanceOf(this) == Σ marketRetained + feesAccrued` and a burn can never spend the
-///         collateral a winner is owed. The burn is wrapped end-to-end and degrades to a treasury
-///         forward on any failure: resolution is what unlocks redemptions and must never be held
-///         hostage to a DEX. The operator stays centralized only
+///         `LibUtils.swapAndBurn`. Fee USDT and backing USDT are disjoint claims on one balance, so
+///         the global solvency statement becomes `usdt.balanceOf(this) == Σ marketRetained +
+///         feesAccrued` and a burn can never spend the collateral a winner is owed.
+///
+///         The burn runs in its OWN transaction, never inside `resolve`. That is a correction, not a
+///         preference: with the swap inline, a fee-bearing resolve cost ~490k gas against ~122k
+///         without, the swap's share moved with Uniswap pool state, and an under-estimated relayer
+///         tx exhausted the `resolve` frame and left the round unresolved — freezing redemptions.
+///         try/catch does not help, because it catches reverts and not gas exhaustion. Keeping the
+///         swap off this path is what makes "the burn can never block a resolution" actually true. The operator stays centralized only
 ///         for matching liveness and resolution correctness — it can no longer steal funds, force
 ///         positions, inflate fees, or withhold winnings. See `REMEDIATION_V2.md`.
 contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
@@ -60,7 +64,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     error MarketMismatch();
     error OptionMismatch();
     error FeeBreakdownInvalid();
-    /// @notice Buyback-and-burn: caller of the manual retry is neither `buybackExecutor` nor the
+    /// @notice Buyback-and-burn: caller is neither an allow-listed `buybackExecutors` entry nor the
     ///         owner. (The automatic burn inside `resolve` has no caller check — it runs on the
     ///         resolver's authority.)
     error OnlyBuybackExecutor();
@@ -220,7 +224,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///         `FillSettled` / `MintMatched` so an indexer can reconstruct each round's burn budget
     ///         from events alone, without reading `marketFeeAccrued`.
     event PlatformFeeAccrued(uint256 indexed marketId, uint256 amount, uint256 marketTotal);
-    /// @notice A resolved round's accrued platform fee was swapped for `buybackToken` and burned.
+    /// @notice A finished round's accrued platform fee was swapped for `buybackToken` and burned.
     ///         `tokenBurned` is what the swap returned and `IERC20Burnable.burn` then destroyed —
     ///         mirroring the RAIN protocol's own `RainTokenBurned(uint256 amountBurned)`.
     ///
@@ -244,7 +248,7 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     event BuybackDeferred(uint256 indexed marketId, uint256 amount, bytes reason);
     event BuybackRouteSet(address indexed token, address indexed router, address quoter, bytes path);
     event BuybackSlippageBpsSet(uint256 previous, uint256 current);
-    event BuybackExecutorSet(address indexed previous, address indexed current);
+    event BuybackExecutorSet(address indexed executor, bool allowed);
     /// @notice F-2026-17772: complementary mint now records per-user shares for both legs.
     event ComplementaryMinted(uint256 indexed marketId, address indexed minter, uint256 amount);
     /// @notice F-2026-17772: complementary burn now gated on a complete set the holder owns.
@@ -388,11 +392,16 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///         300 (3%), matching the RAIN protocol's `(quotedAmount * 970) / 1000`.
     uint256 public buybackSlippageBps = 300;
 
-    /// @notice Keeper permitted to call the manual `buybackAndBurn` retry (the owner may always
-    ///         call it). It chooses only *which finished rounds* to retry — the route, the amount,
-    ///         the slippage floor and the destination of the output are all fixed by storage, so a
-    ///         compromised executor can never divert funds.
-    address public buybackExecutor;
+    /// @notice Keepers permitted to call `buybackAndBurn` (the owner may always call it). An
+    ///         allow-list rather than a single address so a backup keeper can be added without
+    ///         displacing the primary — rotation and redundancy without a window where nobody can
+    ///         burn.
+    ///
+    ///         An entry chooses only *which finished rounds* to retire and *when*. The route, the
+    ///         amount, the slippage floor and the destination of the output are all fixed by
+    ///         storage, so a compromised executor can never divert funds. The "when" is still worth
+    ///         guarding, which is why this is a list and not an open door — see `buybackAndBurn`.
+    mapping(address => bool) public buybackExecutors;
 
     // ── Emergency-withdraw timelock (Part A, retained) ─────────────────
     uint256 public constant EMERGENCY_TIMELOCK = 24 hours;
@@ -1021,15 +1030,10 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
 
     // ── Resolution & trustless redemption (F-2026-17778) ────────────────
 
-    /// @dev `nonReentrant` (added with the fee buyback): resolution now makes external calls into
-    ///      the Uniswap quoter/router and the burn token. None of them can re-enter a settlement
-    ///      path, but the guard makes that structural rather than a property of today's route.
-    function resolve(uint256 marketId, int256 settlementPrice, uint8 winner)
-        external
-        nonReentrant
-        onlyResolver
-        whenNotPaused
-    {
+    /// @dev Makes NO external calls, by design. The fee buyback deliberately does not run here —
+    ///      see the note at the end of this function. That keeps `resolve` deterministic in gas and
+    ///      is why it needs no reentrancy guard.
+    function resolve(uint256 marketId, int256 settlementPrice, uint8 winner) external onlyResolver whenNotPaused {
         Market storage m = markets[marketId];
         if (m.startTime == 0) revert MarketNotOpen();
         if (m.resolved) revert AlreadyResolved();
@@ -1049,13 +1053,23 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
 
         emit MarketResolved(marketId, winner, int256(settlementPrice));
 
-        // ── Round end ⇒ buy back and burn this round's fee revenue. The bucket is already final
-        //     here: both `_enterPosition` and `_mintMatch` reject a fill at or past `endTime`, and
-        //     `resolve` itself requires `block.timestamp >= endTime`. `_swapAndBurnRoundFees` never
-        //     reverts — every failure path forwards to `treasury` or re-credits the bucket — so a
-        //     dry pool, a stale route, or a paused burn token can never block a resolution and
-        //     strand user redemptions behind it. ──
-        _swapAndBurnRoundFees(marketId);
+        // ── The buyback is deliberately NOT called here. ──
+        //
+        // It used to be, and that coupling took production down: a fee-bearing round needs ~490k
+        // gas with the swap inline versus ~122k without, and the swap's share varies with Uniswap
+        // pool state. A relayer sizing its gas from an estimate came up 37 gas short, the whole
+        // `resolve` frame ran out of gas, and the round stayed unresolved — blocking redemptions.
+        //
+        // Wrapping the swap in try/catch was not enough, and the reason is worth stating: try/catch
+        // catches a REVERT, not gas exhaustion. When the frame itself runs out, every state write
+        // above is rolled back and no `catch` inside it ever runs. The only way to make "the burn
+        // can never block a resolution" true rather than merely intended is for the burn not to be
+        // here at all.
+        //
+        // The round's fee stays in `marketFeeAccrued[marketId]` — final, because fills revert at
+        // `endTime` — and `buybackAndBurn` retires it in its own transaction. Batching several
+        // finished rounds into one swap is also strictly better priced than one dust swap per
+        // round, so nothing is lost by moving it off this path.
     }
 
     /// @notice F-2026-17778: trustless redemption. A winner claims `userShares[m][msg.sender][winner]`
@@ -1144,15 +1158,26 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
 
     // ── Fee buyback-and-burn ────────────────────────────────────────────
 
-    /// @notice Retry the buyback for rounds whose automatic burn inside `resolve` fell back or was
-    ///         deferred — a route that was not configured yet, a quoter/router revert, a dry pool,
-    ///         or a round that ended but was never resolved (its bucket is final all the same, so
-    ///         its fee is not held hostage to resolution).
-    /// @dev    Reverts only on caller/eligibility errors. Per-round burn failures stay non-reverting
-    ///         exactly as in `resolve`, so one dead round cannot block the rest of the batch.
-    /// @param  marketIds finished rounds to retry. Duplicates are harmless (the second read is 0).
+    /// @notice THE burn entry point. A keeper calls this on a batch of finished rounds; there is no
+    ///         automatic on-chain trigger, deliberately — see the note at the end of `resolve`.
+    ///
+    ///         Eligibility is `block.timestamp >= endTime`, NOT resolution: a round's fee is final
+    ///         once fills stop, so revenue is never held hostage to a round that failed to resolve.
+    ///         Cadence is entirely the keeper's choice. Prefer batching (hourly, say) over one call
+    ///         per round — several rounds through one swap is both cheaper in gas and better priced
+    ///         than a dust swap each. Use `pendingBuyback` to size a batch before sending.
+    ///
+    ///         ACCESS IS GATED, and not for propriety: the caller chooses WHEN the swap executes,
+    ///         and the slippage floor is quoted in-transaction. An attacker who could call this
+    ///         could move the pool, invoke the burn (the quoter then reports the moved price, so the
+    ///         floor tracks the manipulation and protects nothing), and reverse — all atomically.
+    ///         Gating removes that. `buybackExecutors` is an allow-list so a backup keeper can be
+    ///         added without a gap, and the owner can always call this as the manual fallback.
+    /// @dev    Reverts only on caller/eligibility errors. A per-round burn failure is non-reverting
+    ///         (it forwards to `treasury` or defers), so one dead round cannot block the batch.
+    /// @param  marketIds finished rounds to retire. Duplicates are harmless (the second read is 0).
     function buybackAndBurn(uint256[] calldata marketIds) external nonReentrant whenNotPaused {
-        if (msg.sender != buybackExecutor && msg.sender != owner()) revert OnlyBuybackExecutor();
+        if (!buybackExecutors[msg.sender] && msg.sender != owner()) revert OnlyBuybackExecutor();
 
         uint256 len = marketIds.length;
         uint256 total;
@@ -1182,12 +1207,11 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
     ///      every unit received. Modelled on the RAIN protocol's `LibUtils.swapAndBurn` (which runs
     ///      on first claim); here the trigger is round resolution instead.
     ///
-    ///      MUST NOT REVERT. It sits on the resolution path, and a revert there would leave the
-    ///      round unresolved — freezing winners' redemptions over a DEX problem. Every external
-    ///      call is therefore wrapped, and each failure stage forwards the value it is holding to
-    ///      `treasury` (or, with no treasury set, re-credits the round's bucket for a later retry).
-    ///      The bucket is zeroed BEFORE any external call, so a re-entrant path finds nothing left
-    ///      to spend twice.
+    ///      MUST NOT REVERT, so one unburnable round cannot block the rest of a keeper's batch.
+    ///      Every external call is wrapped, and each failure stage forwards the value it is holding
+    ///      to `treasury` (or, with no treasury set, re-credits the round's bucket for a later
+    ///      retry). The bucket is zeroed BEFORE any external call, so a re-entrant path finds
+    ///      nothing left to spend twice.
     function _swapAndBurnRoundFees(uint256 marketId) internal {
         uint256 amountIn = marketFeeAccrued[marketId];
         if (amountIn == 0) return;
@@ -1338,12 +1362,14 @@ contract UpDownSettlement is Ownable2Step, EIP712, ReentrancyGuard {
         emit BuybackSlippageBpsSet(prev, bps);
     }
 
-    /// @notice Set (or clear, with `address(0)`) the keeper allowed to call `buybackAndBurn`. The
-    ///         owner can always call it, so clearing this only narrows the surface.
-    function setBuybackExecutor(address a) external onlyOwner {
-        address prev = buybackExecutor;
-        buybackExecutor = a;
-        emit BuybackExecutorSet(prev, a);
+    /// @notice Add or remove a keeper allowed to call `buybackAndBurn`. Additive, so a backup can
+    ///         be authorised before the primary is retired and there is never a gap with no keeper.
+    ///         The owner can always call `buybackAndBurn`, so an empty list only narrows the surface
+    ///         to the owner rather than disabling burns.
+    function setBuybackExecutor(address a, bool allowed) external onlyOwner {
+        if (a == address(0)) revert ZeroAddress();
+        buybackExecutors[a] = allowed;
+        emit BuybackExecutorSet(a, allowed);
     }
 
     /// @dev A Uniswap V3 path is `token(20) [fee(3) token(20)]+`: 43 bytes for one hop, +23 per

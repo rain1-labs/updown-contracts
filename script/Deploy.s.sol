@@ -149,7 +149,9 @@ contract DeployUpDown is Script {
         address weth = vm.envOr("WETH_ADDRESS", WETH_DEFAULT);
         uint24 usdtWethFee = uint24(vm.envOr("BUYBACK_USDT_WETH_FEE", uint256(USDT_WETH_FEE_DEFAULT)));
         uint24 wethRainFee = uint24(vm.envOr("BUYBACK_WETH_RAIN_FEE", uint256(WETH_RAIN_FEE_DEFAULT)));
-        // Defaults to the relayer so the backend can sweep rounds whose automatic burn fell back.
+        // The keeper that will call `buybackAndBurn`. Allow-listed, not exclusive — more can be
+        // added later with `setBuybackExecutor(addr, true)`. Defaults to the relayer, which is the
+        // process already driving resolution.
         address buybackExecutor = vm.envOr("BUYBACK_EXECUTOR_ADDRESS", relayer);
 
         uint256 preStartWindowSec = vm.envOr("PRE_START_WINDOW_SEC", PRE_START_WINDOW_DEFAULT);
@@ -241,7 +243,7 @@ contract DeployUpDown is Script {
         if (rainToken != address(0) && existingSettlement == address(0)) {
             bytes memory buybackPath = abi.encodePacked(usdt, usdtWethFee, weth, wethRainFee, rainToken);
             settlement.setBuybackRoute(rainToken, swapRouter, swapQuoter, buybackPath);
-            settlement.setBuybackExecutor(buybackExecutor);
+            settlement.setBuybackExecutor(buybackExecutor, true);
             console.log("Buyback route: USDT -> WETH -> RAIN via", swapRouter);
         } else if (rainToken != address(0)) {
             console.log("Buyback route: SKIPPED -- migration mode reuses the old Settlement bytecode,");

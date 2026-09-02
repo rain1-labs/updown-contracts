@@ -48,9 +48,12 @@ import {ForkSafeWallet} from "./utils/ForkSafeWallet.sol";
 ///         1. FEES AND BACKING NEVER MIX. `feesAccrued` and `marketRetained` are disjoint claims on
 ///            the same USDT balance. A burn spends only the former, so it can never consume the
 ///            collateral a winner is owed — nor be starved by it.
-///         2. THE BURN CAN NEVER BLOCK A RESOLUTION. Resolution is what unlocks redemptions, so a
-///            dry pool, an unset route, a reverting quoter or a token that refuses to burn must all
-///            degrade to a treasury forward, never to a revert. Every failure branch is exercised.
+///         2. THE BURN CAN NEVER BLOCK A RESOLUTION. This is now structural: the swap is not on the
+///            resolve path at all. It was, and dev proved why that fails — a fee-bearing resolve
+///            cost ~490k gas against ~122k, the swap's share moved with pool state, and a relayer
+///            sizing gas from an estimate came up 37 gas short, exhausting the frame and leaving
+///            the round unresolved. try/catch catches reverts, not gas exhaustion. Section 3 pins
+///            the decoupling; section 3b still exercises every failure branch of the burn itself.
 contract FeeBuybackBurnTest is Test {
     bytes32 internal constant PAIR = keccak256("BTC/USD");
     uint8 internal constant UP = 1;
@@ -120,6 +123,7 @@ contract FeeBuybackBurnTest is Test {
         s = _newSettlement();
         s.setBuybackRoute(rainAddr, SWAP_ROUTER, QUOTER, _path());
         settlementUsdt0 = usdt.balanceOf(address(s));
+        assertTrue(s.buybackExecutors(executor), "executor allow-listed in _newSettlement");
 
         alice = _fundedWallet("alice");
         bob = _fundedWallet("bob");
@@ -149,7 +153,7 @@ contract FeeBuybackBurnTest is Test {
         n.setResolver(resolver);
         n.setRelayer(relayer);
         n.setTreasury(treasury);
-        n.setBuybackExecutor(executor);
+        n.setBuybackExecutor(executor, true);
     }
 
     function _fundedWallet(string memory name) internal returns (Vm.Wallet memory w) {
@@ -235,19 +239,30 @@ contract FeeBuybackBurnTest is Test {
         s.resolve(mid, 51_000e8, UP);
     }
 
+    /// @dev The burn, in its own transaction — the only way it ever runs. `resolve` does not
+    ///      trigger it, so every burn assertion below goes through here.
+    function _burn(uint256 mid) internal {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = mid;
+        vm.prank(executor);
+        s.buybackAndBurn(ids);
+    }
+
     /// @dev Contract-held USDT above whatever was already sitting at the deploy address.
     function _heldUsdt() internal view returns (uint256) {
         return usdt.balanceOf(address(s)) - settlementUsdt0;
     }
 
     // ── 1. The happy path, against the real route ───────────────────────
+    //
+    // NOTE: every burn below goes through `_burn` (i.e. `buybackAndBurn`). `resolve` never burns.
 
-    /// The whole feature end to end on the live chain: a round's fee accrues, resolution swaps it
+    /// The whole feature end to end on the live chain: a round's fee accrues, a keeper retires it
     /// through the production path, and RAIN's real total supply actually goes down.
     ///
     /// This is the assertion a mock cannot make. If RAIN did not implement `burn`, or the route did
     /// not exist at the configured tiers, `burned` would be 0 and the fee would sit in the treasury.
-    function test_resolveBurnsRealRainThroughTheProductionRoute() public forked {
+    function test_buybackAndBurn_burnsRealRainThroughTheProductionRoute() public forked {
         uint256 mid = _market();
         uint256 fee = _fillWithFee(mid, ROUND_FEE);
 
@@ -257,7 +272,13 @@ contract FeeBuybackBurnTest is Test {
 
         uint256 supplyBefore = rain.totalSupply();
         _endRound(mid);
+
+        // Resolution alone burns nothing — the swap is off that path by design.
         _resolve(mid);
+        assertEq(rain.totalSupply(), supplyBefore, "resolve did NOT burn");
+        assertEq(s.marketFeeAccrued(mid), fee, "fee still waiting for the keeper");
+
+        _burn(mid);
 
         uint256 burned = supplyBefore - rain.totalSupply();
         console.log("USDT spent:       ", fee);
@@ -281,6 +302,7 @@ contract FeeBuybackBurnTest is Test {
 
         _endRound(mid);
         _resolve(mid);
+        _burn(mid);
 
         assertEq(s.marketRetained(mid), SET_SIZE, "backing survives the burn untouched");
         assertEq(_heldUsdt(), SET_SIZE, "only the fee left; backing intact");
@@ -309,13 +331,13 @@ contract FeeBuybackBurnTest is Test {
         _endRound(midA);
         vm.expectEmit(true, false, false, false, address(s));
         emit FeesBoughtBackAndBurned(midA, 0); // amount unchecked; the live route prices it
-        _resolve(midA);
+        _burn(midA);
 
         assertEq(s.marketFeeAccrued(midB), ROUND_FEE * 2, "B's budget untouched");
         assertEq(s.feesAccrued(), ROUND_FEE * 2, "aggregate dropped by exactly A's fee");
 
         _endRound(midB);
-        _resolve(midB);
+        _burn(midB);
         assertEq(s.feesAccrued(), 0, "both budgets retired");
     }
 
@@ -328,7 +350,7 @@ contract FeeBuybackBurnTest is Test {
         assertEq(s.marketFeeAccrued(mid), ROUND_FEE * 2, "fills accumulate into one bucket");
 
         _endRound(mid);
-        _resolve(mid);
+        _burn(mid);
         assertEq(s.feesAccrued(), 0, "one burn for the round's whole fee");
     }
 
@@ -348,12 +370,18 @@ contract FeeBuybackBurnTest is Test {
         s.enterPosition(f);
     }
 
-    /// A round that took no fee resolves without touching the router at all.
-    function test_resolveWithNoFeeIsANoOp() public forked {
+    /// A round that took no fee has nothing to retire, and says so rather than burning dust.
+    function test_roundWithNoFeeHasNothingToBurn() public forked {
         uint256 mid = _market();
         uint256 supplyBefore = rain.totalSupply();
         _endRound(mid);
         _resolve(mid);
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = mid;
+        vm.expectRevert(UpDownSettlement.NothingToBuyback.selector);
+        vm.prank(executor);
+        s.buybackAndBurn(ids);
 
         assertEq(rain.totalSupply(), supplyBefore, "nothing bought, nothing burned");
         assertEq(s.feesAccrued(), 0);
@@ -392,10 +420,66 @@ contract FeeBuybackBurnTest is Test {
         }
     }
 
-    // ── 3. The burn can never block a resolution ────────────────────────
+    // ── 3. Resolution is decoupled from the burn ────────────────────────
 
-    /// No route configured yet: the fee is forwarded to the treasury and the round still resolves.
-    function test_unconfiguredRoute_forwardsToTreasuryAndStillResolves() public forked {
+    /// THE property this design exists for, stated as a test.
+    ///
+    /// The burn used to run inside `resolve`, and that coupling took dev down: a fee-bearing
+    /// resolve needed ~490k gas against ~122k without, the swap's share moved with pool state, and
+    /// a relayer sizing gas from an estimate came up 37 gas short — exhausting the `resolve` frame
+    /// and leaving the round unresolved. try/catch did not save it, because it catches reverts and
+    /// not gas exhaustion. So the swap is off this path entirely: here the route is broken in every
+    /// way at once, and resolution neither notices nor costs more.
+    function test_resolveIsUnaffectedByATotallyBrokenRoute() public forked {
+        uint256 mid = _market();
+        _fillWithFee(mid, ROUND_FEE);
+        _endRound(mid);
+
+        vm.mockCallRevert(QUOTER, abi.encodeWithSelector(IQuoter.quoteExactInput.selector), "quote failed");
+        vm.mockCallRevert(SWAP_ROUTER, abi.encodeWithSelector(ISwapRouter.exactInput.selector), "swap failed");
+        vm.mockCallRevert(rainAddr, abi.encodeWithSelector(IERC20Burnable.burn.selector), "burn disabled");
+
+        uint256 gasBefore = gasleft();
+        _resolve(mid);
+        uint256 used = gasBefore - gasleft();
+        console.log("resolve gas with a fee accrued and the route dead:", used);
+
+        assertTrue(s.getMarket(mid).resolved, "resolved");
+        assertEq(s.marketFeeAccrued(mid), ROUND_FEE, "fee untouched, still retirable");
+        assertLt(used, 200_000, "resolve stayed cheap -- no swap on this path");
+
+        vm.prank(bob.addr);
+        assertEq(s.redeem(mid), SET_SIZE, "winner redeems");
+    }
+
+    /// Resolution costs the same whether or not the round carries a fee. Before the split, these
+    /// two numbers differed by 4x, and that difference is what the relayer under-estimated.
+    function test_resolveGasDoesNotDependOnWhetherAFeeAccrued() public forked {
+        uint256 withFee = _market();
+        _fillWithFee(withFee, ROUND_FEE);
+        uint256 noFee = _market();
+
+        _endRound(noFee);
+
+        uint256 g0 = gasleft();
+        _resolve(withFee);
+        uint256 usedWithFee = g0 - gasleft();
+
+        g0 = gasleft();
+        _resolve(noFee);
+        uint256 usedNoFee = g0 - gasleft();
+
+        console.log("resolve gas, fee-bearing round:", usedWithFee);
+        console.log("resolve gas, empty round      :", usedNoFee);
+
+        uint256 delta = usedWithFee > usedNoFee ? usedWithFee - usedNoFee : usedNoFee - usedWithFee;
+        assertLt(delta, 15_000, "a fee-bearing resolve is not materially more expensive");
+    }
+
+    // ── 3b. The burn's own failure branches, driven through buybackAndBurn ──
+
+    /// No route configured yet: the fee is forwarded to the treasury rather than stranded.
+    function test_unconfiguredRoute_forwardsToTreasury() public forked {
         s = _newSettlement(); // no setBuybackRoute
         settlementUsdt0 = usdt.balanceOf(address(s));
         _approve(alice, s);
@@ -404,24 +488,22 @@ contract FeeBuybackBurnTest is Test {
         uint256 mid = _market();
         _fillWithFee(mid, ROUND_FEE);
         _endRound(mid);
-        _resolve(mid);
+        _burn(mid);
 
-        assertTrue(s.getMarket(mid).resolved, "resolution succeeded without a route");
         assertEq(usdt.balanceOf(treasury), ROUND_FEE, "fee forwarded to treasury instead of burned");
         assertEq(s.feesAccrued(), 0, "accounting cleared");
         assertEq(s.marketFeeAccrued(mid), 0);
     }
 
-    /// A reverting quoter must not take the resolution down with it.
+    /// A reverting quoter degrades instead of reverting the keeper's whole batch.
     function test_quoterRevert_fallsBackToTreasury() public forked {
         uint256 mid = _market();
         _fillWithFee(mid, ROUND_FEE);
         _endRound(mid);
 
         vm.mockCallRevert(QUOTER, abi.encodeWithSelector(IQuoter.quoteExactInput.selector), "quote failed");
-        _resolve(mid);
+        _burn(mid);
 
-        assertTrue(s.getMarket(mid).resolved, "resolved despite the quoter reverting");
         assertEq(usdt.balanceOf(treasury), ROUND_FEE, "fee forwarded, not stranded");
         assertEq(s.feesAccrued(), 0);
     }
@@ -434,9 +516,8 @@ contract FeeBuybackBurnTest is Test {
         _endRound(mid);
 
         vm.mockCallRevert(SWAP_ROUTER, abi.encodeWithSelector(ISwapRouter.exactInput.selector), "swap failed");
-        _resolve(mid);
+        _burn(mid);
 
-        assertTrue(s.getMarket(mid).resolved, "resolved despite the swap reverting");
         assertEq(usdt.balanceOf(treasury), ROUND_FEE, "fee forwarded");
         assertEq(usdt.allowance(address(s), SWAP_ROUTER), 0, "failed swap left no allowance");
         assertEq(s.feesAccrued(), 0);
@@ -451,23 +532,22 @@ contract FeeBuybackBurnTest is Test {
 
         vm.mockCall(QUOTER, abi.encodeWithSelector(IQuoter.quoteExactInput.selector), abi.encode(uint256(0)));
         uint256 supplyBefore = rain.totalSupply();
-        _resolve(mid);
+        _burn(mid);
 
         assertEq(rain.totalSupply(), supplyBefore, "no swap attempted against a dry route");
         assertEq(usdt.balanceOf(treasury), ROUND_FEE, "fee forwarded instead");
     }
 
     /// A token that refuses to burn: the RAIN was already bought with real USDT, so it is the RAIN
-    /// — not the USDT — that gets forwarded, and the round still resolves.
+    /// — not the USDT — that gets forwarded.
     function test_burnRevert_forwardsTheBoughtTokenToTreasury() public forked {
         uint256 mid = _market();
         _fillWithFee(mid, ROUND_FEE);
         _endRound(mid);
 
         vm.mockCallRevert(rainAddr, abi.encodeWithSelector(IERC20Burnable.burn.selector), "burn disabled");
-        _resolve(mid);
+        _burn(mid);
 
-        assertTrue(s.getMarket(mid).resolved, "resolved despite the token refusing to burn");
         assertGt(rain.balanceOf(treasury), 0, "the bought RAIN went to the treasury");
         assertEq(rain.balanceOf(address(s)), 0, "settlement retains none of it");
         assertEq(usdt.balanceOf(treasury), 0, "the USDT was genuinely spent on the swap");
@@ -476,27 +556,31 @@ contract FeeBuybackBurnTest is Test {
 
     /// The slippage floor is real: quote high enough that the live pool cannot meet the floor, and
     /// the REAL router rejects the fill ("Too little received"). The settlement degrades rather
-    /// than eating the loss — this is the sandwich-protection path.
+    /// than eating the loss.
+    ///
+    /// Note what this floor does and does not do. It is quoted in-transaction, so it defends
+    /// against the pool moving between the keeper deciding to burn and the swap landing. It does
+    /// NOT defend against a caller who manipulates the pool and then triggers the burn in the same
+    /// transaction — the quoter would report the manipulated price and the floor would track it.
+    /// That is precisely why `buybackAndBurn` is access-gated rather than permissionless.
     function test_slippageFloorIsEnforcedByTheRealRouter() public forked {
         uint256 mid = _market();
         _fillWithFee(mid, ROUND_FEE);
         _endRound(mid);
 
         uint256 honest = IQuoter(QUOTER).quoteExactInput(_path(), ROUND_FEE);
-        // 10x the honest quote → a floor no real fill can reach.
         vm.mockCall(QUOTER, abi.encodeWithSelector(IQuoter.quoteExactInput.selector), abi.encode(honest * 10));
 
         uint256 supplyBefore = rain.totalSupply();
-        _resolve(mid);
+        _burn(mid);
 
         assertEq(rain.totalSupply(), supplyBefore, "no RAIN bought at the bad price");
         assertEq(usdt.balanceOf(treasury), ROUND_FEE, "unfillable floor rejected, fee forwarded");
     }
 
-    /// A treasury that cannot receive is the nastiest version of the problem: real USDT can
-    /// blacklist an address, and a bare `safeTransfer` on the fallback path would let a blacklisted
-    /// treasury brick every resolution — and every redemption behind it. It degrades to a deferral.
-    function test_unreceivableTreasury_defersInsteadOfBrickingResolution() public forked {
+    /// A treasury that cannot receive: real USDT can blacklist an address, so the fallback forward
+    /// must not revert either. It degrades to a deferral that keeps the accounting exact.
+    function test_unreceivableTreasury_defersInsteadOfLosingTheFee() public forked {
         uint256 mid = _market();
         _fillWithFee(mid, ROUND_FEE);
         _endRound(mid);
@@ -506,24 +590,15 @@ contract FeeBuybackBurnTest is Test {
 
         vm.expectEmit(true, false, false, false, address(s));
         emit BuybackDeferred(mid, ROUND_FEE, "");
-        _resolve(mid);
+        _burn(mid);
 
-        assertTrue(s.getMarket(mid).resolved, "resolution survived an unreceivable treasury");
         assertEq(s.marketFeeAccrued(mid), ROUND_FEE, "fee deferred back to its round");
         assertEq(s.feesAccrued(), ROUND_FEE, "accounting stays exact");
         assertEq(_heldUsdt(), SET_SIZE + ROUND_FEE, "backing + fee both still held");
 
-        // Winners are unaffected — the whole point of not reverting.
-        vm.prank(bob.addr);
-        assertEq(s.redeem(mid), SET_SIZE, "winner still redeems in full");
-
-        // And once the treasury is healthy the deferred fee is retrievable and really burns.
         vm.clearMockedCalls();
-        uint256[] memory ids = new uint256[](1);
-        ids[0] = mid;
         uint256 supplyBefore = rain.totalSupply();
-        vm.prank(executor);
-        s.buybackAndBurn(ids);
+        _burn(mid);
         assertEq(s.feesAccrued(), 0, "retry retired the deferred fee");
         assertLt(rain.totalSupply(), supplyBefore, "and burned real RAIN");
     }
@@ -559,6 +634,65 @@ contract FeeBuybackBurnTest is Test {
         ids[0] = mid;
         s.buybackAndBurn(ids); // owner == address(this)
         assertEq(s.feesAccrued(), 0);
+    }
+
+    /// The allow-list exists so a second keeper can be authorised without displacing the first —
+    /// rotation and redundancy with no window where nobody can burn.
+    function test_buybackExecutors_isAnAllowListNotASingleSlot() public forked {
+        address backup = makeAddr("backup-keeper");
+        s.setBuybackExecutor(backup, true);
+
+        assertTrue(s.buybackExecutors(executor), "primary still authorised");
+        assertTrue(s.buybackExecutors(backup), "backup authorised alongside it");
+
+        uint256 midA = _market();
+        uint256 midB = _market();
+        _fillWithFee(midA, ROUND_FEE);
+        _fillWithFee(midB, ROUND_FEE);
+        _endRound(midB);
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = midA;
+        vm.prank(executor);
+        s.buybackAndBurn(ids);
+
+        ids[0] = midB;
+        vm.prank(backup);
+        s.buybackAndBurn(ids);
+        assertEq(s.feesAccrued(), 0, "either keeper can retire a round");
+    }
+
+    /// Removing one keeper leaves the other working — and the owner path is never removable.
+    function test_buybackExecutors_canBeRevokedIndividually() public forked {
+        address backup = makeAddr("backup-keeper");
+        s.setBuybackExecutor(backup, true);
+        s.setBuybackExecutor(executor, false);
+
+        assertFalse(s.buybackExecutors(executor), "primary revoked");
+        assertTrue(s.buybackExecutors(backup), "backup unaffected");
+
+        uint256 mid = _market();
+        _fillWithFee(mid, ROUND_FEE);
+        _endRound(mid);
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = mid;
+        vm.expectRevert(UpDownSettlement.OnlyBuybackExecutor.selector);
+        vm.prank(executor);
+        s.buybackAndBurn(ids);
+
+        vm.prank(backup);
+        s.buybackAndBurn(ids);
+        assertEq(s.feesAccrued(), 0);
+    }
+
+    function test_setBuybackExecutor_rejectsZeroAndIsOwnerOnly() public forked {
+        vm.expectRevert(UpDownSettlement.ZeroAddress.selector);
+        s.setBuybackExecutor(address(0), true);
+
+        vm.expectRevert();
+        vm.prank(makeAddr("stranger"));
+        s.setBuybackExecutor(makeAddr("x"), true);
     }
 
     function test_buybackAndBurn_rejectsStrangers() public forked {
@@ -599,13 +733,13 @@ contract FeeBuybackBurnTest is Test {
         s.buybackAndBurn(ids);
     }
 
-    /// A round already burned at resolution cannot be burned twice — the bucket is zeroed before
-    /// any external call, so there is nothing left to double-spend.
+    /// A round already burned cannot be burned twice — the bucket is zeroed before any external
+    /// call, so there is nothing left to double-spend.
     function test_feeCannotBeBurnedTwice() public forked {
         uint256 mid = _market();
         _fillWithFee(mid, ROUND_FEE);
         _endRound(mid);
-        _resolve(mid);
+        _burn(mid);
 
         uint256[] memory ids = new uint256[](1);
         ids[0] = mid;
@@ -714,6 +848,7 @@ contract FeeBuybackBurnTest is Test {
 
         _endRound(mid);
         _resolve(mid);
+        _burn(mid);
         assertEq(_heldUsdt(), s.marketRetained(mid) + s.feesAccrued(), "after the burn");
 
         vm.prank(bob.addr);

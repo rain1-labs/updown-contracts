@@ -68,19 +68,33 @@ through rain.trade's Alchemy Modular Account v2 (see `test/OrderSessionForkTest.
 - Fees are **taker-paid**: `makerFee` goes peer-to-peer to the maker; `platformFee` is retained
   by the Settlement. Neither ever touches market backing. A pure resting maker order pays no fee.
 - **`platformFee` is bought back and burned per round.** It accrues to `marketFeeAccrued[marketId]`
-  (aggregated in `feesAccrued`), and `resolve` spends that round's bucket buying RAIN on Uniswap V3
-  and calls `ERC20Burnable.burn` on everything it receives — the same swap-then-burn the RAIN
-  protocol runs in `LibUtils.swapAndBurn`, triggered at round end instead of first claim. A round's
-  bucket is already final at `endTime` because fills revert there.
-  - The slippage floor is derived on-chain (`IQuoter.quoteExactInput` × `10000 - buybackSlippageBps`,
-    default 300 = 3%), since resolution has no caller to supply a trustworthy `amountOutMinimum`.
-  - **The burn can never block a resolution.** Every external call is wrapped: an unset route, a
-    reverting quoter or router, a dry pool, or a token that refuses to burn all forward the value to
-    `treasury` (`BuybackFallbackToTreasury`) rather than reverting — resolution is what unlocks
-    redemptions, so it must not be hostage to a DEX. With no treasury configured the fee is
-    re-credited to its own round (`BuybackDeferred`) and stays retrievable.
-  - `buybackAndBurn(marketIds)` is the owner/`buybackExecutor` retry for rounds that fell back, or
-    for rounds that ended but were never resolved. Route config is owner-only via `setBuybackRoute`,
+  (aggregated in `feesAccrued`), and a keeper calls `buybackAndBurn(marketIds)` to spend those
+  buckets on RAIN via Uniswap V3, calling `ERC20Burnable.burn` on everything received — the same
+  swap-then-burn the RAIN protocol runs in `LibUtils.swapAndBurn`. A round's bucket is final at
+  `endTime` because fills revert there; eligibility is `endTime`, not resolution, so revenue is
+  never hostage to a round that failed to resolve.
+  - **The burn is NOT inside `resolve`.** It was, and that took dev down on 2026-09-02: a
+    fee-bearing resolve cost ~490k gas against ~122k without, the swap's share moved with Uniswap
+    pool state, and a relayer sizing gas from an estimate came up 37 gas short — exhausting the
+    `resolve` frame and leaving rounds unresolved, which blocks `redeem`. try/catch did not save it:
+    **it catches reverts, not gas exhaustion**, so the frame's own OOG rolled back every state write
+    and no inner `catch` ran. Keeping the swap off that path is what makes "the burn can never block
+    a resolution" true rather than intended.
+  - **Cadence is off-chain.** Nothing schedules the burn; if the keeper never runs it, fees just
+    accumulate (safely). Batching (hourly) is both cheaper and better priced than a swap per round.
+  - **Access is gated** to the `buybackExecutors` allow-list or the owner — a security property,
+    not bookkeeping. Measured on the live RAIN pool (`test/BuybackSandwich.t.sol`): a caller who can
+    pick the moment can push the pool, trigger the burn and unwind atomically. On a 5,000 USDT burn
+    that destroyed **94%** of the RAIN that should have been burned and paid the attacker ~2,528
+    USDT, with the 3% floor never once biting.
+    The caller picks *when* the swap runs and the slippage floor is quoted in-transaction, so a
+    permissionless caller could move the pool, trigger the burn against the manipulated quote (the
+    floor would track the manipulation and protect nothing), and reverse, atomically.
+  - The slippage floor is `IQuoter.quoteExactInput` × `10000 - buybackSlippageBps` (default 300 = 3%).
+  - A per-round failure degrades rather than reverting the batch: an unset route, a reverting quoter
+    or router, a dry pool, or an unburnable token forward the value to `treasury`
+    (`BuybackFallbackToTreasury`); if that forward also fails the fee is re-credited to its own round
+    (`BuybackDeferred`) and stays retrievable. Route config is owner-only via `setBuybackRoute`,
     which validates the V3 path starts at USDT and ends at the burn token.
   - Global solvency is now `usdt.balanceOf(settlement) == Σ marketRetained + feesAccrued`; the two
     pots are disjoint, so a burn can never spend collateral owed to winners.
@@ -173,15 +187,26 @@ per-user shares directly and users exit without the relayer.
 **Both dev and prod run on Arbitrum One.** Dev is not a testnet: it differs only by using a
 valueless dev-USDT and a mock Data Streams verifier. Nothing runs on Sepolia.
 
-Live as of 2026-08-10 (these are the OUTGOING deployments being replaced in the key rotation):
+**Live as of 2026-09-02.** Full history is in `deployments/` — one JSON per deploy, plus a
+dated log in `deployments/README.md`.
 
 | | Dev | Prod |
 |---|---|---|
-| UpDownSettlement | `0x9d1298C0124E0DF23c0DeD9121E530Fb7269c9CE` | `0x7978871Ebd82511d2f27da02507AD97b65f734e3` |
-| ChainlinkResolver | `0xCe53c30c95b58fD01145159A889e9D2Ae613837d` | `0xE1D74Ea6d3024dc52e66B5707Eb6D00BABf08301` |
-| UpDownAutoCycler | `0x4997a2a31a9c597a00ad6aecf2b4263562c65c12` | `0x9872bb8197b3052d0c9fe1a57e83b19f9319787c` |
+| UpDownSettlement | `0xB1c5b4A41236aaD2D8F0Fb428C78954d42a2313b` | `0x4B662f68BD6C40e192e28C1045E829A4B10C754e` |
+| ChainlinkResolver | `0x48fD463D42a40c3f52FdDF81AB67175260555ADf` | `0x8fae4F242b9eACEFDaB02375605784ee86b2076c` |
+| UpDownAutoCycler | `0xbCC639e7044f539B549c77acCc6E792C80bd8982` | `0x38288B8534768eAe23EddAB178dbe9CB1Ae49688` |
 | USDT | `0xCa4f77A38d8552Dd1D5E44e890173921B67725F4` (mock) | `0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9` |
+| RAIN (buyback target) | `0x43976a124e6834b541840Ce741243dAD3dd538DA` | `0x25118290e6A5f4139381D072181157035864099d` |
 | Data Streams VerifierProxy | `0x9c8BA5dE25aB2fd183704c354Edf118fa3dA81b4` (mock) | `0x478Aa2aC9F6D65F84e09D9185d126c3a17c2a93C` (real) |
+
+**Dev carries the fee buyback; prod does not yet.** The dev stack above was redeployed twice on
+2026-09-02 — the second time to move the burn off the `resolve` path after the first version took
+dev down on gas (see `deployments/README.md` and `docs/operations.md`). Prod still runs the
+pre-buyback Settlement, so `platformFee` there still goes to the treasury on each fill.
+
+The Settlement is **not upgradeable and holds no proxy**, and `ChainlinkResolver.trustedSettlement`
+/ `UpDownAutoCycler.settlement`+`resolver` are immutable — so any Settlement change replaces all
+three addresses and orphans the old markets. Budget for that when planning a prod cutover.
 
 Shared Arbitrum One infrastructure:
 ```

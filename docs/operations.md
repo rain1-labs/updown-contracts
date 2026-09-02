@@ -51,21 +51,60 @@ Owner clawback is `withdrawLink(amount)`. `Deploy.s.sol` cites a 5 LINK floor.
 ## Fee buyback-and-burn
 
 `platformFee` no longer lands in the treasury on each fill. It accrues to the round that earned
-it (`marketFeeAccrued[marketId]`, summed in `feesAccrued`), and `resolve` spends that round's
-bucket buying RAIN on Uniswap V3 and burning everything it receives. A round's bucket is already
-final when `resolve` runs, because fills revert at `endTime`.
+it (`marketFeeAccrued[marketId]`, summed in `feesAccrued`). A **keeper** then calls
+`buybackAndBurn(marketIds)`, which spends those buckets on RAIN via Uniswap V3 and burns
+everything it receives. A round's bucket is final once `block.timestamp >= endTime`, because
+fills revert there.
 
+- **The burn is NOT on the resolve path, and that is deliberate.** See the incident note below.
+- **Cadence is the keeper's call.** Nothing on-chain schedules the burn: if the keeper never runs
+  it, fees simply accumulate (safely, and stay retirable). Prefer batching — hourly, say — over
+  one call per round. Several rounds through one swap is cheaper in gas and better priced than a
+  dust swap each. `pendingBuyback(marketIds)` sizes a batch before sending, so the keeper can
+  skip a call that would revert `NothingToBuyback`.
+- **Eligibility is `endTime`, not resolution.** A round that ended but never resolved can still be
+  retired, so fee revenue is never hostage to a resolution failure.
+- **Access is gated** to an allow-list (`buybackExecutors`, managed with
+  `setBuybackExecutor(addr, bool)`) or the owner. A list rather than one slot so a backup keeper
+  can be authorised before the primary is retired — rotation with no gap where nobody can burn.
+  This is a
+  security property, not bookkeeping: the caller picks *when* the swap runs, and the slippage
+  floor is quoted in the same transaction. A permissionless caller could move the pool, trigger
+  the burn — the quoter would then report the manipulated price, so the floor would track the
+  manipulation and protect nothing — and reverse, atomically. The owner path is the manual
+  fallback if a keeper dies.
 - **Configure once:** `setBuybackRoute(rainToken, router, quoter, path)`. The path must start at
   USDT and end at the burn token or the call reverts `InvalidBuybackPath` — a misconfiguration
   fails here rather than as a silent stream of fallback events. `Deploy.s.sol` composes the
   USDT → WETH → RAIN path from env and calls this when `RAIN_TOKEN_ADDRESS` is set.
 - **Slippage:** derived on-chain per burn as `quote × (10000 − buybackSlippageBps) / 10000`
-  (default 300 = 3%). Resolution has no caller to supply an `amountOutMinimum`, so it cannot be
-  a call argument. Tune with `setBuybackSlippageBps`.
-- **The burn cannot block a resolution.** An unset route, a reverting quoter or router, a dry
-  pool (zero quote), a token that refuses to burn, or a treasury that cannot receive all degrade
-  instead of reverting. This matters because `redeem` reverts `NotResolved` until `resolve`
-  lands — a DEX problem must never become a redemption outage.
+  (default 300 = 3%). Tune with `setBuybackSlippageBps`.
+- **A failing burn degrades, never reverts the batch.** An unset route, a reverting quoter or
+  router, a dry pool (zero quote), a token that refuses to burn, or a treasury that cannot
+  receive all forward or defer instead, so one dead round cannot block the rest.
+
+### Why the burn is not inside `resolve` (dev incident, 2026-09-02)
+
+It was, briefly, and it took dev down. Numbers from the live chain:
+
+| resolve | gas |
+|---|---|
+| round with no fee (burn short-circuits) | ~122,650 |
+| round with a fee (quoter + swap + burn) | ~489,750 |
+
+The relayer sized its gas limit from an estimate plus ~3% (126,290 on a 122,650 call). That was
+fine while `resolve` was deterministic. With a Uniswap swap inside, the cost moves with pool
+state, and one tx came up **37 gas short**: limit 489,625, needed 489,662. Every fee-bearing
+round then failed to resolve, and `redeem` reverts `NotResolved` until it does.
+
+Wrapping the swap in try/catch did not help, and the reason is worth remembering: **try/catch
+catches a revert, not gas exhaustion.** When the `resolve` frame itself ran out, every state
+write in it was rolled back and no `catch` inside it ever ran. `ChainlinkResolver` caught the
+failure one level up and emitted `ResolveFailed` with an empty reason — so the outer tx reported
+success while the round stayed unresolved.
+
+Moving the swap off the path is what makes "the burn can never block a resolution" true rather
+than merely intended. `test_resolveIsUnaffectedByATotallyBrokenRoute` pins it.
 
 ### Monitoring
 
@@ -74,6 +113,8 @@ final when `resolve` runs, because fills revert at `endTime`.
 | `FeesBoughtBackAndBurned` | Normal path — the round's fee became burned RAIN. Carries the burned amount only; the USDT spent is the sum of that round's `PlatformFeeAccrued`. | none |
 | `BuybackFallbackToTreasury` | Burn failed; value forwarded to the treasury. `token` says which stage failed: USDT = quote/swap, RAIN = the burn itself. `reason` carries the raw revert. | triage the route; the forwarded value is in the treasury, not recoverable by `buybackAndBurn` |
 | `BuybackDeferred` | Burn failed AND the forward failed (or no treasury set). The fee is re-credited to its own round and is still in the contract. | fix the route, then `buybackAndBurn([marketId])` |
+
+Nothing to monitor on `resolve` any more — it no longer touches the buyback.
 
 A steady stream of either fallback event means the route is wrong or the pool is too thin for
 the fee sizes being burned — not that funds are lost.
@@ -87,8 +128,9 @@ treasury) are injected with `vm.mockCallRevert` against those same real addresse
 exercises the real settlement path with exactly one external answer replaced.
 
 - RAIN `0x25118290e6A5f4139381D072181157035864099d` **does** implement `burn(uint256)` — a
-  resolution burned 299.35 RAIN for a 5 USDT round fee and the token's `totalSupply` fell by
-  exactly that amount.
+  `buybackAndBurn` burned ~298 RAIN for a 5 USDT round fee and the token's `totalSupply` fell by
+  exactly that amount. Dev RAIN `0x43976a124e6834b541840Ce741243dAD3dd538DA` behaves identically
+  (`npm run test:buyback:dev`).
 - The `USDT --500--> WETH --100--> RAIN` path (the tiers `Deploy.s.sol` encodes) quotes and fills.
 - **Depth is comfortable.** Price impact from a 5 USDT burn to a 1,440 USDT burn (one pair's
   whole day of 5-minute rounds) is **8 bps** — far inside the 300 bps default tolerance. Batching
@@ -107,20 +149,12 @@ this feature.
 Re-run this after any route change (a new fee tier, a migrated pool) — a route that quotes zero
 sends every round to the treasury fallback silently.
 
-### Retry
-
-`buybackAndBurn(marketIds)` — owner or `buybackExecutor`. Works on any round past its `endTime`,
-including rounds that ended but were never resolved, so fee revenue is not hostage to resolution.
-Reverts `RoundNotEnded` for an in-flight round and `NothingToBuyback` when every named round is
-already empty. `pendingBuyback(marketIds)` is the matching view for picking a batch.
-
 ### Gas
 
-`resolve` now performs a quoter call, a swap and a burn on any round that took a fee — budget
-materially more gas per resolution than before. `ChainlinkResolver` wraps `settlement.resolve` in
-try/catch, so an under-gassed keeper tx surfaces as `ResolveFailed` and leaves the market
-retryable rather than corrupting state; a keeper that is chronically short on gas will show up as
-markets that never resolve.
+`resolve` is back to ~122k and deterministic — it makes no external calls. Size the burn job's own
+gas from the batch: one swap is ~370k on top of the per-round bookkeeping, so a batch of N rounds
+is roughly `370k + N × 30k`. Give it real headroom rather than estimate-plus-a-few-percent: the
+swap's cost moves with pool state, which is exactly what caught the relayer out above.
 
 ## Rebates
 
