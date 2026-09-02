@@ -65,8 +65,39 @@ through rain.trade's Alchemy Modular Account v2 (see `test/OrderSessionForkTest.
   — the maximum TOTAL fee that signer accepts across all fills of that order. Relayer-supplied
   fees exceeding it revert `FeeExceedsTakerCap` (F-2026-17731). `orderFeesPaid` accumulates
   per order hash so partial fills cannot be split to charge the cap N times.
-- Fees are **taker-paid and peer-to-peer**: `platformFee` → `treasury`, `makerFee` → the maker.
-  Neither ever touches market backing. A pure resting maker order pays no fee.
+- Fees are **taker-paid**: `makerFee` goes peer-to-peer to the maker; `platformFee` is retained
+  by the Settlement. Neither ever touches market backing. A pure resting maker order pays no fee.
+- **`platformFee` is bought back and burned per round.** It accrues to `marketFeeAccrued[marketId]`
+  (aggregated in `feesAccrued`), and a keeper calls `buybackAndBurn(marketIds)` to spend those
+  buckets on RAIN via Uniswap V3, calling `ERC20Burnable.burn` on everything received — the same
+  swap-then-burn the RAIN protocol runs in `LibUtils.swapAndBurn`. A round's bucket is final at
+  `endTime` because fills revert there; eligibility is `endTime`, not resolution, so revenue is
+  never hostage to a round that failed to resolve.
+  - **The burn is NOT inside `resolve`.** It was, and that took dev down on 2026-09-02: a
+    fee-bearing resolve cost ~490k gas against ~122k without, the swap's share moved with Uniswap
+    pool state, and a relayer sizing gas from an estimate came up 37 gas short — exhausting the
+    `resolve` frame and leaving rounds unresolved, which blocks `redeem`. try/catch did not save it:
+    **it catches reverts, not gas exhaustion**, so the frame's own OOG rolled back every state write
+    and no inner `catch` ran. Keeping the swap off that path is what makes "the burn can never block
+    a resolution" true rather than intended.
+  - **Cadence is off-chain.** Nothing schedules the burn; if the keeper never runs it, fees just
+    accumulate (safely). Batching (hourly) is both cheaper and better priced than a swap per round.
+  - **Access is gated** to the `buybackExecutors` allow-list or the owner — a security property,
+    not bookkeeping. Measured on the live RAIN pool (`test/BuybackSandwich.t.sol`): a caller who can
+    pick the moment can push the pool, trigger the burn and unwind atomically. On a 5,000 USDT burn
+    that destroyed **94%** of the RAIN that should have been burned and paid the attacker ~2,528
+    USDT, with the 3% floor never once biting.
+    The caller picks *when* the swap runs and the slippage floor is quoted in-transaction, so a
+    permissionless caller could move the pool, trigger the burn against the manipulated quote (the
+    floor would track the manipulation and protect nothing), and reverse, atomically.
+  - The slippage floor is `IQuoter.quoteExactInput` × `10000 - buybackSlippageBps` (default 300 = 3%).
+  - A per-round failure degrades rather than reverting the batch: an unset route, a reverting quoter
+    or router, a dry pool, or an unburnable token forward the value to `treasury`
+    (`BuybackFallbackToTreasury`); if that forward also fails the fee is re-credited to its own round
+    (`BuybackDeferred`) and stays retrievable. Route config is owner-only via `setBuybackRoute`,
+    which validates the V3 path starts at USDT and ends at the burn token.
+  - Global solvency is now `usdt.balanceOf(settlement) == Σ marketRetained + feesAccrued`; the two
+    pots are disjoint, so a burn can never spend collateral owed to winners.
 - Market-maker rebates are separate: `accumulateRebate` credits a counter (relayer-called),
   claimed later via permissionless `claimRebate`, bounded by a rolling
   `rebateBudgetPerWindow` / `rebateWindowDuration` circuit-breaker (F-2026-17779).
@@ -156,15 +187,43 @@ per-user shares directly and users exit without the relayer.
 **Both dev and prod run on Arbitrum One.** Dev is not a testnet: it differs only by using a
 valueless dev-USDT and a mock Data Streams verifier. Nothing runs on Sepolia.
 
-Live as of 2026-08-10 (these are the OUTGOING deployments being replaced in the key rotation):
+**Live as of 2026-09-02.** Full history is in `deployments/` — one JSON per deploy, plus a
+dated log in `deployments/README.md`.
 
 | | Dev | Prod |
 |---|---|---|
-| UpDownSettlement | `0x9d1298C0124E0DF23c0DeD9121E530Fb7269c9CE` | `0x7978871Ebd82511d2f27da02507AD97b65f734e3` |
-| ChainlinkResolver | `0xCe53c30c95b58fD01145159A889e9D2Ae613837d` | `0xE1D74Ea6d3024dc52e66B5707Eb6D00BABf08301` |
-| UpDownAutoCycler | `0x4997a2a31a9c597a00ad6aecf2b4263562c65c12` | `0x9872bb8197b3052d0c9fe1a57e83b19f9319787c` |
+| UpDownSettlement | `0xB1c5b4A41236aaD2D8F0Fb428C78954d42a2313b` | `0x9eaFEEC65C74CE98DA62C6f6b154880e6c64476e` |
+| ChainlinkResolver | `0x48fD463D42a40c3f52FdDF81AB67175260555ADf` | `0x8C7634dEfaC202491d7842C0CC174610E158b5a6` |
+| UpDownAutoCycler | `0xbCC639e7044f539B549c77acCc6E792C80bd8982` | `0x882F83659DFd6e0E2705F696F8d0F49F3d7CAdb0` |
 | USDT | `0xCa4f77A38d8552Dd1D5E44e890173921B67725F4` (mock) | `0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9` |
+| RAIN (buyback target) | `0x43976a124e6834b541840Ce741243dAD3dd538DA` | `0x25118290e6A5f4139381D072181157035864099d` |
 | Data Streams VerifierProxy | `0x9c8BA5dE25aB2fd183704c354Edf118fa3dA81b4` (mock) | `0x478Aa2aC9F6D65F84e09D9185d126c3a17c2a93C` (real) |
+
+**Both environments now carry the fee buyback**, cut over on 2026-09-02. Dev was redeployed twice
+that day — the second time to move the burn off the `resolve` path after the first version took dev
+down on gas — and prod went straight to the corrected design. Full timeline in
+`deployments/README.md`; behaviour in `docs/operations.md`.
+
+**What the backend must do that it did not before:** the burn has no on-chain trigger. A keeper
+calls `buybackAndBurn(marketIds)` on finished rounds — currently the relayer, on a 15-minute
+cadence. Without that job, fees accrue in the Settlement and nothing is ever burned. `resolve` no
+longer touches the buyback at all, and is back to ~122k gas and deterministic.
+
+**Previous stacks, still live and still redeemable:**
+
+| | Dev | Prod |
+|---|---|---|
+| UpDownSettlement | `0xE607dD4bc70385286f76681b300512E0Be72fFa9` | `0x4B662f68BD6C40e192e28C1045E829A4B10C754e` |
+
+A fresh Settlement deploy never writes to the previous one, so old markets stay resolvable and
+holders can still `redeem()`. Prod's old Settlement held **68.306446 USDT** of unredeemed winnings
+at cutover — it does not migrate; users claim it there, or the backend pushes it with the
+permissionless `redeemFor(marketId, holders[])`. Every user's USDT allowance also points at the old
+address and must be re-approved before their first trade on the new one.
+
+The Settlement is **not upgradeable and holds no proxy**, and `ChainlinkResolver.trustedSettlement`
+/ `UpDownAutoCycler.settlement`+`resolver` are immutable — so any Settlement change replaces all
+three addresses. Budget for that before planning the next one.
 
 Shared Arbitrum One infrastructure:
 ```

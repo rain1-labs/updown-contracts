@@ -4,17 +4,25 @@ pragma solidity ^0.8.29;
 import {Test, StdInvariant, Vm} from "forge-std/Test.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
+import {ForkSafeWallet} from "./utils/ForkSafeWallet.sol";
 
 /// @notice Remediation V2 conservation invariants (non-custodial share model).
 ///
 /// Invariants under test, holding at every external-call boundary:
-///   (1) usdt.balanceOf(settlement) == Σ marketRetained[mid]            (global solvency)
+///   (1) usdt.balanceOf(settlement) == Σ marketRetained[mid] + feesAccrued  (global solvency)
 ///   (2) unresolved market: marketRetained == optionShares[UP] == optionShares[DOWN]
 ///   (3) resolved market:   marketRetained == optionShares[winner]      (winners fully backed)
 ///
 /// (1) is what proves the protocol can always pay every winner who redeems: the contract never
-/// holds less USDT than it owes. `enterPosition` is balance-neutral (cash moves peer-to-peer), so
-/// only mint / burn / redeem move the contract balance — each by exactly the `marketRetained` delta.
+/// holds less USDT than it owes. `enterPosition` moves cash peer-to-peer, so only mint / burn /
+/// redeem move the backing — each by exactly the `marketRetained` delta.
+///
+/// The fee buyback adds a SECOND custodied pot: `platformFee` now stays in the contract as the
+/// resolving round's burn budget instead of leaving for the treasury. The two sums are kept
+/// strictly disjoint — no fee path touches `marketRetained` and no backing path touches
+/// `feesAccrued` — so (1) is the load-bearing statement that a round's burn budget can never be
+/// funded out of, nor starve, the collateral owed to winners. The handler charges a real
+/// `platformFee` on every fill precisely so this is exercised rather than assumed.
 /// (2)+(3) prove F-2026-17771 (no backing reuse) and F-2026-17776 (backing can't be withdrawn out
 /// from under a live position): shares are only ever created/destroyed as complete sets, and a fill
 /// merely transfers an existing share, so the per-option totals can never diverge from the backing.
@@ -59,7 +67,9 @@ contract UpDownPROInvariant is StdInvariant, Test {
         for (uint256 i = 0; i < n; i++) {
             sumRetained += s.marketRetained(handler.marketIdAt(i));
         }
-        assertEq(usdt.balanceOf(address(s)), sumRetained, "balance == sum(marketRetained)");
+        assertEq(
+            usdt.balanceOf(address(s)), sumRetained + s.feesAccrued(), "balance == sum(marketRetained) + feesAccrued"
+        );
     }
 
     function invariant_retainedBacksOutstandingShares() public view {
@@ -114,7 +124,7 @@ contract ShareHandler is Test {
             markets.push(s.createMarket(PAIR, 3600, 50_000e8));
         }
         for (uint256 i = 0; i < 5; i++) {
-            Vm.Wallet memory w = vm.createWallet(string(abi.encodePacked("w", i)));
+            Vm.Wallet memory w = ForkSafeWallet.derive(string(abi.encodePacked("w", i)));
             usdt.mint(w.addr, 1_000_000e18);
             vm.prank(w.addr);
             usdt.approve(address(s), type(uint256).max);
@@ -181,7 +191,10 @@ contract ShareHandler is Test {
         fillAmount = bound(fillAmount, 1, held);
         priceBps = uint16(bound(uint256(priceBps), 1, 9999));
         uint256 cashPart = (uint256(priceBps) * fillAmount) / 10000;
-        if (usdt.balanceOf(buyer.addr) < cashPart) return;
+        // Charge a real platform fee so the buyback bucket is exercised on every fill. The taker
+        // (the buyer on this path) funds it on top of the cash leg.
+        uint256 platformFee = fillAmount / 100;
+        if (usdt.balanceOf(buyer.addr) < cashPart + platformFee) return;
 
         UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
             maker: seller.addr,
@@ -203,7 +216,7 @@ contract ShareHandler is Test {
             orderType: 0,
             price: priceBps,
             amount: fillAmount,
-            maxFee: 0,
+            maxFee: platformFee,
             nonce: ++nonceCounter,
             expiry: block.timestamp + 3600
         });
@@ -214,7 +227,7 @@ contract ShareHandler is Test {
             takerOrder: takerOrder,
             takerSignature: _sign(buyer, takerOrder),
             fillAmount: fillAmount,
-            platformFee: 0,
+            platformFee: platformFee,
             makerFee: 0
         });
         vm.prank(relayer);
@@ -236,7 +249,8 @@ contract ShareHandler is Test {
         fillAmount = bound(fillAmount, 1, 1_000e18);
         uint256 upCash = (pUp * fillAmount) / 10000;
         uint256 downCash = fillAmount - upCash;
-        if (usdt.balanceOf(upBuyer.addr) < upCash || usdt.balanceOf(downBuyer.addr) < downCash) return;
+        uint256 platformFee = fillAmount / 100;
+        if (usdt.balanceOf(upBuyer.addr) < upCash || usdt.balanceOf(downBuyer.addr) < downCash + platformFee) return;
 
         UpDownSettlement.Order memory makerOrder = UpDownSettlement.Order({
             maker: upBuyer.addr,
@@ -258,7 +272,7 @@ contract ShareHandler is Test {
             orderType: 0,
             price: pDown,
             amount: fillAmount,
-            maxFee: 0,
+            maxFee: platformFee,
             nonce: ++nonceCounter,
             expiry: block.timestamp + 3600
         });
@@ -268,7 +282,7 @@ contract ShareHandler is Test {
             takerOrder: takerOrder,
             takerSignature: _sign(downBuyer, takerOrder),
             fillAmount: fillAmount,
-            platformFee: 0,
+            platformFee: platformFee,
             makerFee: 0
         });
         vm.prank(relayer);
