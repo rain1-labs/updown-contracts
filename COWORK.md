@@ -192,21 +192,38 @@ dated log in `deployments/README.md`.
 
 | | Dev | Prod |
 |---|---|---|
-| UpDownSettlement | `0xB1c5b4A41236aaD2D8F0Fb428C78954d42a2313b` | `0x4B662f68BD6C40e192e28C1045E829A4B10C754e` |
-| ChainlinkResolver | `0x48fD463D42a40c3f52FdDF81AB67175260555ADf` | `0x8fae4F242b9eACEFDaB02375605784ee86b2076c` |
-| UpDownAutoCycler | `0xbCC639e7044f539B549c77acCc6E792C80bd8982` | `0x38288B8534768eAe23EddAB178dbe9CB1Ae49688` |
+| UpDownSettlement | `0xB1c5b4A41236aaD2D8F0Fb428C78954d42a2313b` | `0x9eaFEEC65C74CE98DA62C6f6b154880e6c64476e` |
+| ChainlinkResolver | `0x48fD463D42a40c3f52FdDF81AB67175260555ADf` | `0x8C7634dEfaC202491d7842C0CC174610E158b5a6` |
+| UpDownAutoCycler | `0xbCC639e7044f539B549c77acCc6E792C80bd8982` | `0x882F83659DFd6e0E2705F696F8d0F49F3d7CAdb0` |
 | USDT | `0xCa4f77A38d8552Dd1D5E44e890173921B67725F4` (mock) | `0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9` |
 | RAIN (buyback target) | `0x43976a124e6834b541840Ce741243dAD3dd538DA` | `0x25118290e6A5f4139381D072181157035864099d` |
 | Data Streams VerifierProxy | `0x9c8BA5dE25aB2fd183704c354Edf118fa3dA81b4` (mock) | `0x478Aa2aC9F6D65F84e09D9185d126c3a17c2a93C` (real) |
 
-**Dev carries the fee buyback; prod does not yet.** The dev stack above was redeployed twice on
-2026-09-02 — the second time to move the burn off the `resolve` path after the first version took
-dev down on gas (see `deployments/README.md` and `docs/operations.md`). Prod still runs the
-pre-buyback Settlement, so `platformFee` there still goes to the treasury on each fill.
+**Both environments now carry the fee buyback**, cut over on 2026-09-02. Dev was redeployed twice
+that day — the second time to move the burn off the `resolve` path after the first version took dev
+down on gas — and prod went straight to the corrected design. Full timeline in
+`deployments/README.md`; behaviour in `docs/operations.md`.
+
+**What the backend must do that it did not before:** the burn has no on-chain trigger. A keeper
+calls `buybackAndBurn(marketIds)` on finished rounds — currently the relayer, on a 15-minute
+cadence. Without that job, fees accrue in the Settlement and nothing is ever burned. `resolve` no
+longer touches the buyback at all, and is back to ~122k gas and deterministic.
+
+**Previous stacks, still live and still redeemable:**
+
+| | Dev | Prod |
+|---|---|---|
+| UpDownSettlement | `0xE607dD4bc70385286f76681b300512E0Be72fFa9` | `0x4B662f68BD6C40e192e28C1045E829A4B10C754e` |
+
+A fresh Settlement deploy never writes to the previous one, so old markets stay resolvable and
+holders can still `redeem()`. Prod's old Settlement held **68.306446 USDT** of unredeemed winnings
+at cutover — it does not migrate; users claim it there, or the backend pushes it with the
+permissionless `redeemFor(marketId, holders[])`. Every user's USDT allowance also points at the old
+address and must be re-approved before their first trade on the new one.
 
 The Settlement is **not upgradeable and holds no proxy**, and `ChainlinkResolver.trustedSettlement`
 / `UpDownAutoCycler.settlement`+`resolver` are immutable — so any Settlement change replaces all
-three addresses and orphans the old markets. Budget for that when planning a prod cutover.
+three addresses. Budget for that before planning the next one.
 
 Shared Arbitrum One infrastructure:
 ```

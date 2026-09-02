@@ -225,3 +225,40 @@ it is not part of `Deploy.s.sol`.
 `0x1B4320cC…26E6a` owns all three and `pendingOwner` is zero — same posture as
 the earlier stacks recorded above.
 
+### 2026-09-02 — prod cutover to the fee buyback
+
+`prod-25890279.json` is live:
+
+| | Address |
+|---|---|
+| UpDownSettlement | `0x9eaFEEC65C74CE98DA62C6f6b154880e6c64476e` |
+| ChainlinkResolver | `0x8C7634dEfaC202491d7842C0CC174610E158b5a6` |
+| UpDownAutoCycler | `0x882F83659DFd6e0E2705F696F8d0F49F3d7CAdb0` |
+
+A fresh Settlement, not a migration — the buyback cannot ship any other way, so
+`EXISTING_SETTLEMENT_ADDRESS` was deliberately left empty. Note this also means
+`npm run preflight:prod` and `npm run upgrade:prod` were both unusable here:
+each hard-requires that variable, because each exists for the resolver/cycler
+upgrade path where the Settlement genuinely is preserved.
+
+**Sequence used.** Both pairs were `removePair`d on the old cycler
+`0x38288B85…49688` first (txs `0xfa4e4a14…` BTC, `0x57bc31a2…` ETH), which
+stopped market creation immediately; the four markets still open then drained
+to resolution over ~10 minutes and the deploy ran against a fully settled old
+stack. That ordering costs a short window with no tradeable markets — the
+alternative (deploy first, repoint the keeper, retire the old cycler after)
+avoids the gap but runs both stacks briefly. The gap was accepted here.
+
+**The old stack is untouched and still works.** A fresh Settlement deploy never
+writes to the previous one, so `0x4B662f68…0C754e` keeps its own resolver and
+cycler, old markets stay resolvable, and holders can still `redeem()`. It held
+**68.306446 USDT** of unredeemed winnings at cutover — not stranded, but it does
+not migrate either. Users can claim it themselves, or the backend can push it
+with the permissionless `redeemFor(marketId, holders[])`.
+
+**Two more things do not carry across a Settlement replacement:** every user's
+USDT allowance points at the old address and must be re-approved before their
+first trade, and the 60m timeframe is re-enabled by the fresh cycler's
+constructor and needs `toggleTimeframe(2, false)` again.
+
+
