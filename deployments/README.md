@@ -72,6 +72,14 @@ The cycler was deprecated on 2026-08-13 (tx
 never accept keeper work. Both contracts are inert; they are listed here only so
 an audit run against this directory does not conclude they were never deployed.
 
+## `safe/` — owner batches
+
+`script/safe-batch.mjs` (`npm run safe:pending:<env>`, `npm run safe:call:<env>`) writes one
+Safe{Wallet} Transaction Builder file per proposed owner batch here:
+`<label>-<name>-<UTC stamp>.json`. Public calldata only. Commit them — they are the record of
+what was *proposed*; the Safe's transaction history is the record of what *executed*, and
+the two can legitimately differ (a batch can be edited or dropped in the UI).
+
 ## Prod stack lineage
 
 | Resolver | AutoCycler | Record | State |
@@ -157,6 +165,32 @@ the timeframe is off, at `1787047200` (2026-08-18 10:00 UTC) on prod and
 re-enable — see the re-enable procedure in
 [`../docs/operations.md`](../docs/operations.md#timeframes). Flipping the flag
 back on alone makes the cycler grind one skipped hour per `performUpkeep`.
+
+### 2026-09-03 — prod live stack handed to the Safe
+
+Ownership of all three live prod contracts (`prod-25890279.json`) moved from the deployer
+EOA `0xCEcEF153…f3c32` to the client Safe **`0x26dA6f5D8062a700aE01da2616e78F2132FCaBd8`**
+(Safe 1.4.1+L2, 2-of-4). Two steps, per Ownable2Step:
+
+1. `npm run handoff:prod` — `transferOwnership(safe)` x3 from the deployer.
+2. Safe batch `safe/prod-pending-20260903-121915.json` — `acceptOwnership()` x3 via
+   MultiSendCallOnly, the Safe's first ever transaction (nonce 0), 2 confirmations:
+   tx `0x8fb68e4b8edf7aa46e1d40a3cf5b572bb75b7ebaed331490c650700d4f08d5b9`, Arbitrum block 501319218 (2026-09-03 12:26 UTC).
+
+| Contract | Address | owner() after |
+|---|---|---|
+| UpDownSettlement | `0x9eaFEEC6…476e` | Safe |
+| ChainlinkResolver | `0x8C7634dE…b5a6` | Safe |
+| UpDownAutoCycler | `0x882F8365…Adb0` | Safe |
+
+`pendingOwner` is zero on all three. Nothing operational changed: resolver, cycler, forwarder,
+relayer and pairs are as deployed and `paused == false`. From here every owner call on prod is
+a Safe batch (`npm run safe:call:prod`), and `upgrade:prod` runs in owner-batch mode — see
+[`../docs/operations.md`](../docs/operations.md#ownership).
+
+**Still on the deployer key:** the retired Settlement `0x4B662f68…754e` (holds ~68.3 USDT of
+unredeemed winnings; its owner keeps the 24h emergency-withdraw path) and the retired cycler
+`0x38288B85…49688` (0 pairs, not `deprecated()`), plus every older resolver/cycler pair.
 
 ### 2026-09-02 — dev redeployed twice for the fee buyback
 

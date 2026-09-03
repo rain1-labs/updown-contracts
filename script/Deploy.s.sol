@@ -60,6 +60,21 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///                                     `pendingOwner` — the target must call
 ///                                     `acceptOwnership()` to complete it. No lockout
 ///                                     risk if the address is wrong.
+///                                     In migration mode, if the existing Settlement is
+///                                     ALREADY owned by OWNER_ADDRESS (a Safe on prod),
+///                                     the script switches to OWNER-BATCH MODE: it still
+///                                     deploys + configures Resolver and AutoCycler and
+///                                     offers them to OWNER_ADDRESS, but every
+///                                     `settlement.set*()` call is skipped and left for
+///                                     the owner to execute (`npm run safe:pending:<label>`
+///                                     builds that batch). Dev, where the deployer stays
+///                                     owner, is unaffected and still wires in one shot.
+///   DISABLED_TIMEFRAMES             — comma-separated timeframe indexes to switch off on
+///                                     the fresh cycler (0 = 5m, 1 = 15m, 2 = 60m) BEFORE
+///                                     ownership is handed off. The constructor enables all
+///                                     three; both environments run without 60m since
+///                                     2026-08-18, and once the owner is a Safe every
+///                                     post-deploy toggle costs a signing round.
 ///   DEPLOY_LABEL                    — names the JSON deployment record, e.g. "dev" /
 ///                                     "prod". Both environments share chain id 42161,
 ///                                     so the record is keyed on this rather than on
@@ -168,12 +183,40 @@ contract DeployUpDown is Script {
             existingSettlement = address(0);
         }
 
+        uint256[] memory disabledTimeframes = vm.envOr("DISABLED_TIMEFRAMES", ",", new uint256[](0));
+
         console.log("Deployer:", deployer);
         console.log("USDT:", usdt);
         console.log("Relayer:", relayer);
         console.log("Treasury:", treasury);
+
+        // ── Who wires the Settlement? ───────────────────────────────────────
+        // Every `settlement.set*()` below is onlyOwner. On a fresh deploy the deployer is
+        // the owner by construction. In migration mode the Settlement may already belong to
+        // OWNER_ADDRESS (the prod Safe), and then this key cannot repoint it: the new
+        // Resolver + AutoCycler are deployed, configured and offered to OWNER_ADDRESS, and
+        // the Settlement calls are deferred to an owner batch. Decided BEFORE the broadcast
+        // so an ownership mismatch aborts with nothing on chain.
+        bool ownerBatchMode;
+        address previousResolver;
+        address previousCycler;
         if (existingSettlement != address(0)) {
             console.log("Migration mode -- reusing Settlement:", existingSettlement);
+            UpDownSettlement live = UpDownSettlement(existingSettlement);
+            previousResolver = live.resolver();
+            previousCycler = live.autocycler();
+            address liveOwner = live.owner();
+            if (liveOwner == deployer) {
+                console.log("Direct mode -- deployer owns Settlement; it is repointed in this broadcast");
+            } else if (newOwner != address(0) && liveOwner == newOwner) {
+                ownerBatchMode = true;
+                console.log("OWNER-BATCH mode -- Settlement is owned by OWNER_ADDRESS:", liveOwner);
+                console.log("  setResolver/setAutocycler/setRelayer/setTreasury are NOT sent from here.");
+                console.log("  After this deploy, build the owner batch: npm run safe:pending:<label>");
+            } else {
+                console.log("Settlement owner:", liveOwner);
+                revert("Settlement is owned by neither the deployer nor OWNER_ADDRESS -- aborting before broadcast");
+            }
         } else {
             console.log("Fresh deploy mode -- Settlement will be created");
         }
@@ -222,12 +265,20 @@ contract DeployUpDown is Script {
         // pre-Streams-strike contracts. The relayer + treasury are
         // unchanged across migrations but we set them idempotently to
         // preserve a single source of truth in the deploy script.
-        settlement.setResolver(address(resolver));
-        settlement.setAutocycler(address(cycler));
-        settlement.setRelayer(relayer);
-        settlement.setTreasury(treasury);
-        // F-2026-17779: seed the rolling rebate budget circuit-breaker.
-        settlement.setRebateBudget(REBATE_BUDGET_PER_WINDOW, REBATE_WINDOW_DURATION);
+        if (!ownerBatchMode) {
+            settlement.setResolver(address(resolver));
+            settlement.setAutocycler(address(cycler));
+            settlement.setRelayer(relayer);
+            settlement.setTreasury(treasury);
+            // F-2026-17779: seed the rolling rebate budget circuit-breaker.
+            settlement.setRebateBudget(REBATE_BUDGET_PER_WINDOW, REBATE_WINDOW_DURATION);
+        } else {
+            // Owner-batch mode: the Settlement keeps pointing at the OLD stack until the
+            // owner executes setResolver + setAutocycler. The new contracts are inert until
+            // then (Settlement's onlyResolver / onlyAutocycler reject them), so deploying
+            // them ahead of the batch is safe.
+            console.log("Settlement NOT repointed (owner-batch mode)");
+        }
 
         // Fee buyback-and-burn. Skipped when RAIN_TOKEN_ADDRESS is unset — a dev network with no
         // RAIN pool must still deploy, and an unconfigured route degrades safely (fees accrue and
@@ -280,11 +331,20 @@ contract DeployUpDown is Script {
         // this must be explicit or a fresh deploy silently regresses.
         cycler.setPreStartWindowSec(preStartWindowSec);
 
+        // Timeframe policy. The constructor enables all three and, once the cycler belongs
+        // to a Safe, each toggle is a signing round — so apply it here, pre-handoff.
+        for (uint256 i; i < disabledTimeframes.length; ++i) {
+            cycler.toggleTimeframe(disabledTimeframes[i], false);
+            console.log("Timeframe disabled (index):", disabledTimeframes[i]);
+        }
+
         // Ownership handoff LAST — every owner-gated call above must land while
         // the deployer still holds the role. Ownable2Step: this only sets
         // `pendingOwner`; the target completes it with `acceptOwnership()`.
         if (newOwner != address(0) && newOwner != deployer) {
-            settlement.transferOwnership(newOwner);
+            // In owner-batch mode the Settlement already belongs to newOwner and the
+            // deployer may not call transferOwnership on it (onlyOwner).
+            if (!ownerBatchMode) settlement.transferOwnership(newOwner);
             resolver.transferOwnership(newOwner);
             cycler.transferOwnership(newOwner);
         }
@@ -335,6 +395,12 @@ contract DeployUpDown is Script {
             vm.serializeAddress(obj, "keeperForwarder", keeperForwarder);
             vm.serializeAddress(obj, "usdt", usdt);
             vm.serializeAddress(obj, "verifierProxy", verifierProxy);
+            // Migration provenance: what Settlement pointed at before this run, and whether
+            // this run actually moved the pointers (false = owner-batch mode; the owner
+            // still has to). safe-batch.mjs reads resolver/autocycler above to build that.
+            vm.serializeAddress(obj, "previousResolver", previousResolver);
+            vm.serializeAddress(obj, "previousAutocycler", previousCycler);
+            vm.serializeBool(obj, "settlementRepointed", !ownerBatchMode);
             string memory record = vm.serializeAddress(obj, "pendingOwner", newOwner);
             vm.writeJson(record, string.concat("deployments/", label, "-", vm.toString(block.number), ".json"));
             console.log("Deployment record: deployments/%s-%s.json", label, vm.toString(block.number));
@@ -343,11 +409,16 @@ contract DeployUpDown is Script {
         }
 
         console.log("");
-        if (newOwner != address(0) && newOwner != deployer) {
-            console.log("Ownership handoff PENDING. From the new owner, run:");
-            console.log("  cast send %s 'acceptOwnership()'", address(settlement));
-            console.log("  cast send %s 'acceptOwnership()'", address(resolver));
-            console.log("  cast send %s 'acceptOwnership()'", address(cycler));
+        if (ownerBatchMode) {
+            console.log("OWNER-BATCH MODE: Settlement still points at the old stack. The owner must execute:");
+            console.log("  settlement.setResolver / setAutocycler, acceptOwnership on the new Resolver + AutoCycler,");
+            console.log("  deprecate on the old AutoCycler. Build it with: npm run safe:pending:%s", label);
+        } else if (newOwner != address(0) && newOwner != deployer) {
+            console.log("Ownership handoff PENDING. From the new owner, call acceptOwnership() on:");
+            console.log("  %s  (Settlement)", address(settlement));
+            console.log("  %s  (Resolver)", address(resolver));
+            console.log("  %s  (AutoCycler)", address(cycler));
+            console.log("Safe owner: npm run safe:pending:%s builds the batch (add -- --propose to queue it).", label);
         } else {
             console.log("WARNING: owner is still the deployer key. Set OWNER_ADDRESS to hand off.");
         }

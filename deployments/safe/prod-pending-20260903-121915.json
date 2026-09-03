@@ -1,0 +1,48 @@
+{
+  "version": "1.0",
+  "chainId": "42161",
+  "createdAt": 1788437955329,
+  "meta": {
+    "name": "updown prod pending",
+    "description": "prod: 0x9eaFEEC6.acceptOwnership(); 0x8C7634dE.acceptOwnership(); 0x882F8365.acceptOwnership()",
+    "txBuilderVersion": "1.17.1",
+    "createdFromSafeAddress": "0x26dA6f5D8062a700aE01da2616e78F2132FCaBd8",
+    "createdFromOwnerAddress": "",
+    "checksum": "0xe7a6676acc57b2785efd0b104d402f2df0d2ac967a3e78ecbc08f85b0c23fe6a"
+  },
+  "transactions": [
+    {
+      "to": "0x9eaFEEC65C74CE98DA62C6f6b154880e6c64476e",
+      "value": "0",
+      "data": "0x79ba5097",
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": {}
+    },
+    {
+      "to": "0x8C7634dEfaC202491d7842C0CC174610E158b5a6",
+      "value": "0",
+      "data": "0x79ba5097",
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": {}
+    },
+    {
+      "to": "0x882F83659DFd6e0E2705F696F8d0F49F3d7CAdb0",
+      "value": "0",
+      "data": "0x79ba5097",
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": {}
+    }
+  ]
+}

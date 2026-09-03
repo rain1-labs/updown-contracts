@@ -170,6 +170,93 @@ All three contracts are `Ownable2Step`. Transfers require `transferOwnership` fr
 owner, then `acceptOwnership` from the target — a wrong address cannot lock you out.
 Use a Safe multisig on prod: the owner can rewire the resolver and reach collateral.
 
+### Who owns what
+
+| Env | Owner | Why |
+|---|---|---|
+| dev | deployer EOA (`DEPLOYER_PRIVATE_KEY`) | one key, one-shot deploys and upgrades; nothing of value |
+| prod | Safe `0x26dA6f5D8062a700aE01da2616e78F2132FCaBd8` (`OWNER_ADDRESS`), 2-of-4, Safe 1.4.1+L2 | the owner can repoint the resolver, pause, and reach collateral via the 24h emergency path |
+
+The owner is needed for **policy** changes only. Day-to-day operation never touches it:
+the relayer resolves and fills, the keeper forwarder creates markets, the buyback executor
+burns, and `redeem` / `redeemFor` are permissionless. A stalled Safe cannot stall trading.
+
+Owner-only surface, per contract: Settlement — `setResolver`, `setAutocycler`, `setRelayer`,
+`setTreasury`, `setPaused`, `setRebateBudget`, `setDmmRebateBps`, `setBuybackRoute`,
+`setBuybackSlippageBps`, `setBuybackExecutor`, `propose/execute/cancelEmergencyWithdraw`.
+Resolver — `configureFeed`, `configureStreamsFeed`, `setAuthorizedCaller`, `setObservationLag`,
+`withdrawLink`. AutoCycler — `addPair`, `removePair`, `toggleTimeframe`, `setPreStartWindowSec`,
+`setPairTfLastCreated`, `setForwarder`, `deprecate`, `pruneResolved`, `evictUnresolved`,
+`withdrawFunds`.
+
+### Handing a live stack to the Safe
+
+```bash
+npm run handoff:simulate:prod   # read-only: shows the three contracts and what would change
+npm run handoff:prod            # transferOwnership() x3 from the deployer -> pendingOwner = Safe
+npm run safe:pending:prod       # builds the acceptOwnership() x3 batch for the Safe
+```
+
+`script/TransferOwnership.s.sol` reads the Settlement from `EXISTING_SETTLEMENT_ADDRESS` and
+takes the Resolver and AutoCycler from the Settlement's own pointers, so it always acts on
+the stack that is genuinely live. It is idempotent and refuses anything the deployer does
+not own. Until the Safe executes the accept batch the deployer is still the owner, so a
+wrong `OWNER_ADDRESS` is corrected by re-running with the right one.
+
+### Making the Safe do something (proposing)
+
+Every owner call on prod is a Safe transaction: one signer proposes, a second confirms,
+and whoever confirms last executes (that wallet pays the Arbitrum gas). Two ways to propose:
+
+1. **Batch file + Safe{Wallet} UI** (no key in the repo). `script/safe-batch.mjs` writes a
+   Transaction Builder file under `deployments/safe/`. Open Safe{Wallet} > Apps >
+   Transaction Builder, drag the file in, *Create Batch*, *Send Batch*, sign with your wallet.
+   That signature is the proposal; the other signers see it in the queue.
+2. **`--propose`** pushes the same batch into the Safe's queue from the CLI, signed by
+   `SAFE_PROPOSER_PRIVATE_KEY` (or `--ledger` / `--trezor` / `--account <keystore>`). The
+   script computes the hash with the Safe's own `getTransactionHash`, signs the EIP-712
+   `SafeTx`, verifies the signature recovers, and POSTs to the Safe Transaction Service.
+   Multiple calls are wrapped in `MultiSendCallOnly` so they execute atomically.
+
+```bash
+npm run safe:pending:prod                                       # whatever the stack is waiting on
+npm run safe:call:prod -- cycler 'toggleTimeframe(uint256,bool)' 2 false
+npm run safe:call:prod -- settlement 'setPaused(bool)' true --propose
+npm run safe:call:prod -- resolver 'withdrawLink(uint256)' 5000000000000000000 --name link
+```
+
+`settlement` / `resolver` / `cycler` resolve to the live addresses; a raw address works too.
+The batch file is committed as the audit trail of what was proposed; the Safe's own history
+is the record of what executed.
+
+### Upgrading under the Safe (what changes in the scripts)
+
+`Deploy.s.sol`, `UpgradePreflight.s.sol` and `upgrade.sh` all read `settlement.owner()` and
+pick a mode. Nothing needs to be passed — dev keeps working exactly as before.
+
+| | **direct** (owner == deployer; dev) | **owner-batch** (owner == `OWNER_ADDRESS`; prod) |
+|---|---|---|
+| `upgrade.sh` phase 2 `removePair` | sent from the deployer | Safe batch `stop-cycling`; script waits for execution |
+| phase 4 `pruneResolved` | sent from the deployer | skipped (old cycler is deprecated in the final batch) |
+| phase 6 `Deploy.s.sol` | deploys Resolver + AutoCycler **and** repoints Settlement | deploys + configures them, transfers them to the Safe, **does not touch Settlement** |
+| phase 7 | verify | Safe batch `adopt-new-stack`: `setResolver`, `setAutocycler`, `acceptOwnership` x2, `deprecate(old)`; script waits, then verifies |
+
+The new Resolver and AutoCycler are inert until Settlement points at them (its
+`onlyResolver` / `onlyAutocycler` reject them), so deploying ahead of the adopt batch is safe.
+The drain gate still holds: the old cycler has had its pairs removed and stays fenced until
+the adopt batch deprecates it, so nothing can open between the preflight and `setResolver`.
+Expect two signing rounds per upgrade; `--propose` removes the manual import but not the
+second signature.
+
+A **fresh Settlement** deploy (the 2026-09-02 buyback path) needs the Safe only at the end:
+`Deploy.s.sol` does all the wiring while the deployer still owns everything, then transfers
+all three; the Safe's only job is `acceptOwnership` x3 (`npm run safe:pending:prod`), plus
+retiring the previous stack from wherever *that* was owned.
+
+`DISABLED_TIMEFRAMES=2` makes `Deploy.s.sol` switch the 60m slot off before the handoff, so a
+redeploy no longer needs the follow-up `toggleTimeframe` call that would otherwise be a Safe
+round.
+
 ## Pruning
 
 `performUpkeep` calls `_pruneResolved()` to drop finalized markets from the in-contract active
