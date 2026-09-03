@@ -188,9 +188,40 @@ relayer and pairs are as deployed and `paused == false`. From here every owner c
 a Safe batch (`npm run safe:call:prod`), and `upgrade:prod` runs in owner-batch mode — see
 [`../docs/operations.md`](../docs/operations.md#ownership).
 
-**Still on the deployer key:** the retired Settlement `0x4B662f68…754e` (holds ~68.3 USDT of
-unredeemed winnings; its owner keeps the 24h emergency-withdraw path) and the retired cycler
-`0x38288B85…49688` (0 pairs, not `deprecated()`), plus every older resolver/cycler pair.
+**Still on the deployer key, by decision (see the next entry):** the retired Settlement
+`0x4B662f68…754e`, its resolver/cycler pair, and every older resolver/cycler pair. All are inert.
+
+### 2026-09-03 — retired prod Settlement emptied and its cycler deprecated
+
+Follow-up to the handoff above. The retired Settlement `0x4B662f68…754e` was still holding
+**68.306446 USDT** of unredeemed winnings, all of it in four resolved markets and all owned by
+one wallet, `0x6b434001…4847`. Paid out with the permissionless `redeemFor` from the deployer
+key (gas only — `redeemFor` can pay nobody but the share holder):
+
+| Market | Winner | Paid (USDT) | Tx |
+|---|---|---|---|
+| 10072 | UP | 2.173913 | `0x6ac762f06c70ecb9a41c338856745a8188fe0ee74749e4e1f47fcb32ea4ba1d5` |
+| 10190 | UP | 43.103448 | `0xf0b8905c786c1732ddca2d6652505cea2d109f4bdd44cbcde09a22cf2136108e` |
+| 10198 | DOWN | 22.388059 | `0x9358a2ae22435f1ba7893621b5672fd9dd727ae37a7b2021745200612f955b3c` |
+| 10216 | UP | 0.641026 | `0x43ec38b21de8f993bfd5e467c8c63effcaafb2b866d1fc17d3a6ec03a9ed44b0` |
+
+`usdt.balanceOf(settlement)` is now **0** and `marketRetained` is 0 on all four.
+
+The retired cycler `0x38288B85…49688` was then deprecated (tx
+`0x2da10e90da8b2101b93c5e1cc1519ec876a82c388a0ccd3a9042658f22a4c8a8`, Arbitrum block
+501327910), closing the last live door on the old stack: its owner could otherwise `addPair`
+and resume minting markets against the old Settlement.
+
+**Ownership of the retired stack was deliberately NOT transferred to the Safe.** With zero
+collateral, a deprecated cycler and no Settlement trusting its resolver, the deployer key's
+ownership of these contracts controls nothing — the emergency-withdraw path has nothing to
+withdraw. Same reasoning as for the eight older resolver/cycler pairs. The deployer key now
+owns only inert contracts.
+
+Tooling added for this: `script/UnredeemedSweep.s.sol` (find markets still holding collateral)
+and `script/redeem-for.mjs` (find holders from events and push `redeemFor`). Note the sweep
+script is too slow for a 17k-market Settlement over a remote RPC; the market ids above were
+found from `MintMatched` logs instead, then checked with `marketRetained`.
 
 ### 2026-09-02 — dev redeployed twice for the fee buyback
 
