@@ -64,6 +64,8 @@ contract UpgradePreflight is Script {
         address settlementAddr = vm.envAddress("EXISTING_SETTLEMENT_ADDRESS");
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
+        // envOr swallows the "0x" placeholder the env templates ship with.
+        address newOwner = vm.envOr("OWNER_ADDRESS", address(0));
 
         UpDownSettlement settlement = UpDownSettlement(settlementAddr);
 
@@ -82,7 +84,7 @@ contract UpgradePreflight is Script {
         console.log("  Deployer:            ", deployer);
         console.log("");
 
-        _checkOwnership(settlement, oldResolver, oldCycler, deployer);
+        _checkOwnership(settlement, oldResolver, oldCycler, deployer, newOwner);
         _checkDrain(settlement, oldCycler);
         _checkNewStreamIds();
         _checkChainlinkWiring(oldResolver);
@@ -104,36 +106,45 @@ contract UpgradePreflight is Script {
         console.log("=========================================================");
     }
 
-    /// @dev Every owner-gated call in `Deploy.s.sol` runs as `deployer`. If the
-    ///      deployer is not the owner, the deploy reverts mid-broadcast — after the new
-    ///      Resolver and Cycler have already been created and paid for.
+    /// @dev `Deploy.s.sol` has two ways to wire the Settlement. If the deployer owns it, the
+    ///      owner-gated calls run inside the deploy broadcast (direct mode). If OWNER_ADDRESS
+    ///      owns it — the prod Safe — the deploy skips them and they become a Safe batch
+    ///      (owner-batch mode; `upgrade.sh` drives it). Anything else reverts mid-broadcast,
+    ///      after the new Resolver and Cycler have already been created and paid for.
     function _checkOwnership(
         UpDownSettlement settlement,
         ChainlinkResolver oldResolver,
         UpDownAutoCycler oldCycler,
-        address deployer
+        address deployer,
+        address newOwner
     ) internal {
         console.log("-- Ownership --");
         address owner = settlement.owner();
         if (owner == deployer) {
-            pass("deployer owns Settlement");
+            pass("deployer owns Settlement -- DIRECT mode: the deploy repoints it in one broadcast");
+        } else if (newOwner != address(0) && owner == newOwner) {
+            pass("OWNER_ADDRESS owns Settlement -- OWNER-BATCH mode: removePair, setResolver and");
+            console.log("           setAutocycler are Safe transactions; upgrade.sh builds and waits for them");
         } else {
-            fail("deployer is NOT Settlement owner -- setResolver/setAutocycler will revert");
+            fail("Settlement is owned by neither the deployer nor OWNER_ADDRESS -- every owner call would revert");
             console.log("           settlement.owner() =", owner);
+            console.log("           OWNER_ADDRESS      =", newOwner);
         }
 
         if (settlement.pendingOwner() != address(0)) {
             warn("Settlement has a pendingOwner -- an Ownable2Step handoff is mid-flight");
         }
 
-        // Informational: the outgoing contracts stay owned by whoever holds them. That
-        // is fine (they become inert), but a LINK balance left on the old resolver is
-        // only recoverable through its own `withdrawLink`.
-        if (oldResolver.owner() != deployer) {
-            warn("deployer does not own the OLD resolver -- withdrawLink would be unavailable");
+        // The satellites should belong to whoever owns the Settlement. A LINK balance left
+        // on the old resolver is only recoverable through its own `withdrawLink`, and the
+        // old cycler's removePair/deprecate need its owner.
+        if (oldResolver.owner() != owner) {
+            warn("OLD resolver has a different owner than Settlement -- withdrawLink needs that key");
+            console.log("           oldResolver.owner() =", oldResolver.owner());
         }
-        if (oldCycler.owner() != deployer) {
-            warn("deployer does not own the OLD cycler -- cannot removePair/deprecate it");
+        if (oldCycler.owner() != owner) {
+            warn("OLD cycler has a different owner than Settlement -- removePair/deprecate need that key");
+            console.log("           oldCycler.owner() =", oldCycler.owner());
         }
         console.log("");
     }
@@ -166,7 +177,9 @@ contract UpgradePreflight is Script {
         if (cycling == 0) {
             pass("old cycler has no cycling pairs -- no new markets being created");
         } else if (allowUnresolved) {
-            warn("old cycler is still cycling pairs -- it will keep creating markets against a Settlement that no longer accepts it");
+            warn(
+                "old cycler is still cycling pairs -- it will keep creating markets against a Settlement that no longer accepts it"
+            );
             console.log("           cyclingPairCount() =", cycling);
         } else {
             fail("old cycler is STILL CYCLING pairs -- call removePair for each first");

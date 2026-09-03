@@ -16,8 +16,16 @@ Streams.
 - Cycler: `setForwarder(keeper)`, `addPair(BTC/USD)`, `addPair(ETH/USD)`,
   `setPreStartWindowSec(300)`
 - Optional ownership handoff to `OWNER_ADDRESS` (Ownable2Step — sets `pendingOwner` only)
+- Optional `DISABLED_TIMEFRAMES` (e.g. `2`) switched off on the fresh cycler before the handoff
 
 Run via `npm run simulate:dev|prod` first, then `npm run deploy:dev|prod`.
+
+When `EXISTING_SETTLEMENT_ADDRESS` is set and that Settlement is already owned by
+`OWNER_ADDRESS` (the prod Safe), the deploy runs in **owner-batch mode**: it still creates
+and configures Resolver + AutoCycler and offers them to the Safe, but skips every
+`settlement.set*()` call. `npm run safe:pending:prod` then builds the batch the Safe must
+execute. `npm run upgrade:prod` drives the whole sequence and waits for each batch. See
+[operations.md#ownership](operations.md#ownership).
 
 ### Why the Streams feeds are configured in-script
 
@@ -30,6 +38,10 @@ would be permanently locked. `STREAMS_FEED_ID_BTC_USD` / `_ETH_USD` are therefor
 env vars, and an unset value aborts the deploy before anything is broadcast.
 
 ## Existing deployments (manual)
+
+On prod the owner is a Safe, so each `cast send ... --account <OWNER>` below becomes a Safe
+batch: `npm run safe:call:prod -- <settlement|resolver|cycler> '<sig>' <args>` writes it (add
+`--propose` to queue it). Dev is still the deployer key and the commands run as written.
 
 Configure a Streams feed for a pair (owner only):
 
