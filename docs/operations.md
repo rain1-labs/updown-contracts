@@ -257,6 +257,24 @@ retiring the previous stack from wherever *that* was owned.
 redeploy no longer needs the follow-up `toggleTimeframe` call that would otherwise be a Safe
 round.
 
+### Retiring a Settlement
+
+After a fresh-Settlement cutover the old contract keeps every unredeemed winning. Nothing is
+stranded — `redeem` / `redeemFor` are permissionless — but users on the new stack have no UI
+path to it, so push it:
+
+```bash
+node script/redeem-for.mjs prod --settlement <old> --markets 1,2,3          # dry run: holders + amounts
+node script/redeem-for.mjs prod --settlement <old> --markets 1,2,3 --send   # one redeemFor per market
+```
+
+Market ids: `MintMatched` / `ComplementaryMinted` logs give every market that ever held shares;
+check `marketRetained` on those. (`script/UnredeemedSweep.s.sol` does the same by brute force
+but is impractical over a remote RPC beyond a few thousand markets.) Then `deprecate` the old
+cycler. Once the balance is 0 and the cycler is deprecated, transferring the old stack's
+ownership to the Safe buys nothing — it was left on the deployer key on 2026-09-03 for that
+reason.
+
 ## Pruning
 
 `performUpkeep` calls `_pruneResolved()` to drop finalized markets from the in-contract active
